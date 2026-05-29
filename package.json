@@ -29,6 +29,6 @@
   },
   "homepage": "https://github.com/obegron/rootlessRelay#readme",
   "dependencies": {
-    "ws": "^8.20.0"
+    "ws": "^8.20.1"
   }
 }
