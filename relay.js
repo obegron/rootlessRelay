@@ -3,9 +3,13 @@ const dgram = require("dgram");
 const net = require("net");
 const crypto = require("crypto");
 const { getReverseFlow } = require("./tcp_utils");
+const { SlidingWindowRateLimiter } = require("./rate_limiter");
+const { UDPFlowManager } = require("./udp_flow_manager");
 const {
   buildIPv4Packet,
   internetChecksum,
+  parseIPv4Packet,
+  parseUDPDatagram,
   tcpChecksum,
   udpChecksum,
 } = require("./packet_utils");
@@ -102,11 +106,20 @@ const REVERSE_TCP_IDLE_TIMEOUT_MS = process.env.REVERSE_TCP_IDLE_TIMEOUT_MS
   ? parseInt(process.env.REVERSE_TCP_IDLE_TIMEOUT_MS, 10)
   : 45000;
 
+const UDP_FLOW_IDLE_TIMEOUT_MS = process.env.UDP_FLOW_IDLE_TIMEOUT_MS
+  ? parseInt(process.env.UDP_FLOW_IDLE_TIMEOUT_MS, 10)
+  : 30000;
+
+const MAX_UDP_FLOWS_PER_SESSION = process.env.MAX_UDP_FLOWS_PER_SESSION
+  ? parseInt(process.env.MAX_UDP_FLOWS_PER_SESSION, 10)
+  : 256;
+
 // ==============================================================================
 // END OF CONFIGURATION
 // ==============================================================================
 
 const RATE_LIMIT_BPS = RATE_LIMIT_KBPS * 1024;
+const MAX_ETHERNET_IPV4_FRAME_SIZE = 14 + 0xffff;
 
 const connectionsPerIP = new Map();
 const activeSessions = new Map();
@@ -158,6 +171,7 @@ if (ENABLE_WSS) {
   wss = new WebSocket.Server({
     server: httpsServer,
     perMessageDeflate: false,
+    maxPayload: MAX_ETHERNET_IPV4_FRAME_SIZE,
   });
 
   httpsServer.listen(WS_PORT, WS_BIND_ADDRESS);
@@ -169,6 +183,7 @@ if (ENABLE_WSS) {
     port: WS_PORT,
     host: WS_BIND_ADDRESS,
     perMessageDeflate: false,
+    maxPayload: MAX_ETHERNET_IPV4_FRAME_SIZE,
   });
   console.log(`WebSocket VPN server listening on ${WS_BIND_ADDRESS}:${WS_PORT}`);
 }
@@ -206,25 +221,33 @@ class VMSession {
     this.bytesSent = 0;
     this.bytesReceived = 0;
 
-    this.udpSocket = dgram.createSocket("udp4");
+    this.udpFlows = new UDPFlowManager({
+      idleTimeoutMs: UDP_FLOW_IDLE_TIMEOUT_MS,
+      maxFlows: MAX_UDP_FLOWS_PER_SESSION,
+      onResponse: (payload, flow) => {
+        const response = flow.isDNS ? this.filterDNSResponse(payload) : payload;
+        this.sendUDPToVM(
+          response,
+          flow.remotePort,
+          flow.vmPort,
+          flow.remoteIP,
+          flow.vmIP,
+        );
+      },
+      onError: (err, flow) => {
+        if (log_level >= LOG_LEVEL_DEBUG) {
+          console.error(
+            `UDP flow error for ${flow.remoteIP}:${flow.remotePort}: ${err.message}`,
+          );
+        }
+      },
+    });
     this.tcpConnections = new Map();
     this.reverseTcpConnections = new Map();
     this.recentlyClosed = new Set();
-    this.udpResponseListeners = new Map();
     this.udpProxyNatTable = new Map();
 
-    // Sliding Window Rate Limiter
-    this.rateLimitWindowMs = 1000;
-    this.byteSendTimes = [];
-    this.rateLimitQueue = [];
-    this.isRateLimited = false;
-
-    this.rateLimitInterval = setInterval(() => {
-      const now = Date.now();
-      this.byteSendTimes = this.byteSendTimes.filter((entry) =>
-        now - entry.timestamp < this.rateLimitWindowMs
-      );
-    }, 100);
+    this.rateLimiter = new SlidingWindowRateLimiter(RATE_LIMIT_BPS, 1000);
 
     if (log_level >= LOG_LEVEL_DEBUG) {
       console.log(`New session created for ${clientIP}`);
@@ -626,33 +649,10 @@ class VMSession {
     }
   }
 
-  canSend(bytes) {
-    const now = Date.now();
-    const windowStart = now - this.rateLimitWindowMs;
-
-    this.byteSendTimes = this.byteSendTimes.filter((entry) =>
-      entry.timestamp > windowStart
-    );
-
-    const currentUsage = this.byteSendTimes.reduce(
-      (sum, entry) => sum + entry.bytes,
-      0,
-    );
-
-    return currentUsage + bytes <= RATE_LIMIT_BPS;
-  }
-
-  recordSentBytes(bytes) {
-    this.byteSendTimes.push({
-      timestamp: Date.now(),
-      bytes: bytes,
-    });
-  }
-
   handleEthernetFrame(data) {
     this.bytesReceived += data.length;
     try {
-      const frame = Buffer.from(data);
+      const frame = Buffer.isBuffer(data) ? data : Buffer.from(data);
       if (frame.length < 14) return;
 
       const srcMAC = frame.slice(6, 12);
@@ -768,11 +768,11 @@ class VMSession {
   }
 
   handleIPv4(ipPacket) {
-    if (ipPacket.length < 20) return;
+    const parsed = parseIPv4Packet(ipPacket);
+    if (!parsed) return;
 
-    const protocol = ipPacket[9];
-    const srcIP = Array.from(ipPacket.slice(12, 16)).join(".");
-    const dstIP = Array.from(ipPacket.slice(16, 20)).join(".");
+    ipPacket = parsed.packet;
+    const { protocol, srcIP, dstIP } = parsed;
 
     if (log_level >= LOG_LEVEL_DEBUG) {
       const proto = protocol === 6
@@ -786,6 +786,7 @@ class VMSession {
     }
 
     if (protocol === 6 && dstIP === GATEWAY_IP) {
+      if (parsed.moreFragments || parsed.fragmentOffset !== 0) return;
       this.handleReverseTCP(ipPacket);
       return;
     }
@@ -821,9 +822,13 @@ class VMSession {
       }
     }
 
+    // Internet-bound fragments require reassembly before transport parsing.
+    // VM-to-VM fragments above are forwarded unchanged and do not need it.
+    if (parsed.moreFragments || parsed.fragmentOffset !== 0) return;
+
     // Otherwise handle normally (internet-bound traffic)
-    if (protocol === 1) this.handleICMP(ipPacket);
-    else if (protocol === 17) this.handleUDP(ipPacket);
+    if (protocol === 1) this.handleICMP(ipPacket, parsed);
+    else if (protocol === 17) this.handleUDP(ipPacket, parsed);
     else if (protocol === 6) this.handleTCP(ipPacket);
   }
 
@@ -1372,7 +1377,7 @@ class VMSession {
         return;
       }
 
-      if (!this.canSend(toSend)) {
+      if (!this.rateLimiter.tryConsume(toSend)) {
         if (log_level >= LOG_LEVEL_DEBUG) {
           console.log(`   ⏳ Rate limit, waiting...`);
         }
@@ -1388,8 +1393,6 @@ class VMSession {
           `    Sending ${chunk.length}B to VM (queue:${conn.sendQueue.length} inflight:${inFlightBytes} window:${conn.vmWindow})`,
         );
       }
-
-      this.recordSentBytes(chunk.length);
 
       conn.inFlight.push(chunk);
 
@@ -1510,10 +1513,11 @@ class VMSession {
     return udpChecksum(ipPacket);
   }
 
-  handleICMP(ipPacket) {
-    const icmpType = ipPacket[20];
-    const srcIP = Array.from(ipPacket.slice(12, 16)).join(".");
-    const dstIP = Array.from(ipPacket.slice(16, 20)).join(".");
+  handleICMP(ipPacket, parsed = parseIPv4Packet(ipPacket)) {
+    if (!parsed || ipPacket.length < parsed.headerLength + 8) return;
+    const icmpOffset = parsed.headerLength;
+    const icmpType = ipPacket[icmpOffset];
+    const { srcIP, dstIP } = parsed;
 
     if (icmpType === 8 && dstIP === GATEWAY_IP) {
       if (log_level >= LOG_LEVEL_DEBUG) {
@@ -1525,14 +1529,14 @@ class VMSession {
 
       Buffer.from(ipPacket.slice(16, 20)).copy(reply, 12);
       Buffer.from(ipPacket.slice(12, 16)).copy(reply, 16);
-      reply[20] = 0;
+      reply[icmpOffset] = 0;
 
-      reply.writeUInt16BE(0, 22);
-      const icmpCksum = this.calcChecksum(reply.slice(20));
-      reply.writeUInt16BE(icmpCksum, 22);
+      reply.writeUInt16BE(0, icmpOffset + 2);
+      const icmpCksum = this.calcChecksum(reply.subarray(icmpOffset));
+      reply.writeUInt16BE(icmpCksum, icmpOffset + 2);
 
       reply.writeUInt16BE(0, 10);
-      const ipCksum = this.calcChecksum(reply.slice(0, 20));
+      const ipCksum = this.calcChecksum(reply.subarray(0, parsed.headerLength));
       reply.writeUInt16BE(ipCksum, 10);
 
       if (log_level >= LOG_LEVEL_DEBUG) console.log(` ICMP reply`);
@@ -1540,11 +1544,11 @@ class VMSession {
     }
   }
 
-  handleUDP(ipPacket) {
-    const srcPort = ipPacket.readUInt16BE(20);
-    const dstPort = ipPacket.readUInt16BE(22);
-    const srcIP = Array.from(ipPacket.slice(12, 16)).join(".");
-    const dstIP = Array.from(ipPacket.slice(16, 20)).join(".");
+  handleUDP(ipPacket, parsed = parseIPv4Packet(ipPacket)) {
+    const datagram = parseUDPDatagram(ipPacket, parsed);
+    if (!datagram) return;
+    const { srcPort, dstPort, payload } = datagram;
+    const { srcIP, dstIP } = parsed;
 
     if (log_level >= LOG_LEVEL_DEBUG) {
       console.log(`📡 UDP: ${srcPort} -> ${dstPort}`);
@@ -1556,7 +1560,6 @@ class VMSession {
       const hostSocket = udpProxySockets.get(ruleId);
 
       if (hostSocket) {
-        const payload = ipPacket.slice(28);
         if (log_level >= LOG_LEVEL_DEBUG) {
           console.log(
             `[UDP PROXY NAT] Forwarding reply from VM to ${clientRinfo.address}:${clientRinfo.port}`,
@@ -1571,30 +1574,16 @@ class VMSession {
     }
 
     if (dstPort === 67) {
-      this.handleDHCP(ipPacket);
+      this.handleDHCP(payload);
       return;
     }
 
-    const payload = ipPacket.slice(28);
-
     // Check if this is a DNS query (port 53)
     if (dstPort === 53) {
-      const listenerKey = `dns-${srcPort}`;
-
-      // Avoid duplicate listeners
-      if (this.udpResponseListeners.has(listenerKey)) {
-        if (log_level >= LOG_LEVEL_DEBUG) {
-          console.log(
-            `   ⚠ DNS listener already exists for port ${srcPort}, skipping`,
-          );
-        }
-        return;
-      }
-
       if (log_level >= LOG_LEVEL_DEBUG) {
         console.log(`🔍 DNS query detected from port ${srcPort}`);
       }
-      if (log_level >= LOG_LEVEL_TRACE) {
+      if (log_level >= LOG_LEVEL_TRACE && payload.length >= 12) {
         // Parse the DNS question name for tracing
         let qdcount = payload.readUInt16BE(4);
         let offset = 12;
@@ -1605,16 +1594,16 @@ class VMSession {
         console.log(`   🔎 DNS Query for: ${hostname}`);
       }
 
-      this.udpSocket.send(payload, dstPort, dstIP, (err) => {
-        if (err) {
-          console.error(`❌ UDP error:`, err.message);
-        } else {
-          if (log_level >= LOG_LEVEL_DEBUG) {
-            console.log(`✅ DNS query forwarded`);
-          }
-          this.setupDNSResponse(ipPacket, srcPort, dstPort, dstIP, srcIP);
-        }
+      const accepted = this.udpFlows.send(payload, {
+        vmPort: srcPort,
+        vmIP: srcIP,
+        remotePort: dstPort,
+        remoteIP: dstIP,
+        isDNS: true,
       });
+      if (!accepted && log_level >= LOG_LEVEL_DEBUG) {
+        console.log(`UDP flow limit reached; dropping DNS query`);
+      }
       return;
     }
 
@@ -1622,63 +1611,16 @@ class VMSession {
       console.log(`📀 Forwarding UDP to ${dstIP}:${dstPort}`);
     }
 
-    this.udpSocket.send(payload, dstPort, dstIP, (err) => {
-      if (err) {
-        console.error(`❌ UDP error:`, err.message);
-      } else {
-        if (log_level >= LOG_LEVEL_DEBUG) console.log(`✅ UDP forwarded`);
-        this.setupUDPResponse(ipPacket, srcPort, dstPort, dstIP);
-      }
+    const accepted = this.udpFlows.send(payload, {
+      vmPort: srcPort,
+      vmIP: srcIP,
+      remotePort: dstPort,
+      remoteIP: dstIP,
+      isDNS: false,
     });
-  }
-
-  setupDNSResponse(origIP, vmPort, remotePort, remoteIP, vmIP) {
-    const listenerKey = `dns-${vmPort}`;
-    if (this.udpResponseListeners.has(listenerKey)) {
-      if (log_level >= LOG_LEVEL_DEBUG) {
-        console.log(`   ⚠ DNS listener already registered for ${listenerKey}`);
-      }
-      return;
+    if (!accepted && log_level >= LOG_LEVEL_DEBUG) {
+      console.log(`UDP flow limit reached; dropping packet`);
     }
-
-    const handler = (msg, rinfo) => {
-      if (rinfo.address === remoteIP && rinfo.port === remotePort) {
-        if (log_level >= LOG_LEVEL_DEBUG) {
-          console.log(
-            ` DNS response from ${rinfo.address}:${rinfo.port} (${msg.length} bytes)`,
-          );
-        }
-
-        // Filter out IPv6 (AAAA) records from DNS response
-        const filteredResponse = this.filterDNSResponse(msg);
-
-        if (
-          log_level >= LOG_LEVEL_DEBUG && filteredResponse.length !== msg.length
-        ) {
-          console.log(
-            `   🔧 DNS response filtered: ${msg.length} -> ${filteredResponse.length} bytes`,
-          );
-        }
-
-        this.sendUDPToVM(filteredResponse, remotePort, vmPort, remoteIP, vmIP);
-
-        this.udpSocket.removeListener("message", handler);
-        this.udpResponseListeners.delete(listenerKey);
-      }
-    };
-
-    this.udpSocket.on("message", handler);
-    this.udpResponseListeners.set(listenerKey, handler);
-
-    setTimeout(() => {
-      if (this.udpResponseListeners.get(listenerKey) === handler) {
-        this.udpSocket.removeListener("message", handler);
-        this.udpResponseListeners.delete(listenerKey);
-        if (log_level >= LOG_LEVEL_DEBUG) {
-          console.log(`   ⏰ DNS listener timeout for port ${vmPort}`);
-        }
-      }
-    }, 5000);
   }
 
   filterDNSResponse(dnsPacket) {
@@ -1818,34 +1760,6 @@ class VMSession {
     return name;
   }
 
-  setupUDPResponse(origIP, vmPort, remotePort, remoteIP) {
-    if (this.udpResponseListeners.has(vmPort)) return;
-
-    const handler = (msg, rinfo) => {
-      if (rinfo.address === remoteIP && rinfo.port === remotePort) {
-        if (log_level >= LOG_LEVEL_DEBUG) {
-          console.log(` UDP response from ${rinfo.address}:${rinfo.port}`);
-        }
-
-        const vmIP = Array.from(origIP.slice(12, 16)).join(".");
-        this.sendUDPToVM(msg, remotePort, vmPort, remoteIP, vmIP);
-
-        this.udpSocket.removeListener("message", handler);
-        this.udpResponseListeners.delete(vmPort);
-      }
-    };
-
-    this.udpSocket.on("message", handler);
-    this.udpResponseListeners.set(vmPort, handler);
-
-    setTimeout(() => {
-      if (this.udpResponseListeners.get(vmPort) === handler) {
-        this.udpSocket.removeListener("message", handler);
-        this.udpResponseListeners.delete(vmPort);
-      }
-    }, 5000);
-  }
-
   sendUDPToVM(payload, srcPort, dstPort, srcIP, dstIP) {
     const udpLen = 8 + payload.length;
     const udp = Buffer.alloc(udpLen);
@@ -1864,8 +1778,7 @@ class VMSession {
     if (log_level >= LOG_LEVEL_DEBUG) console.log(`  UDP response sent`);
   }
 
-  handleDHCP(ipPacket) {
-    const udp = ipPacket.slice(28);
+  handleDHCP(udp) {
     if (udp.length < 240) return;
 
     const xid = udp.readUInt32BE(4);
@@ -1887,7 +1800,9 @@ class VMSession {
         continue;
       }
 
+      if (off + 1 >= udp.length) return;
       const len = udp[off + 1];
+      if (off + 2 + len > udp.length) return;
       if (opt === 53) msgType = udp[off + 2];
       off += 2 + len;
     }
@@ -2018,13 +1933,7 @@ class VMSession {
       releaseIP(this.vmMAC);
     }
 
-    if (this.udpSocket) {
-      this.udpSocket.close();
-    }
-
-    if (this.rateLimitInterval) {
-      clearInterval(this.rateLimitInterval);
-    }
+    this.udpFlows.close();
 
     /*
     if (this.cleanupInterval) {
@@ -2083,13 +1992,13 @@ wss.on("connection", (ws, req) => {
   const sessionId = crypto.randomUUID();
   activeSessions.set(sessionId, session);
 
-  ws.on("message", (data) => {
-    if (typeof data === "string" || data instanceof String) {
+  ws.on("message", (data, isBinary) => {
+    if (!isBinary) {
       const str = data.toString();
       if (str.startsWith("ping:")) {
         ws.send("pong:" + str.substring(5));
-        return;
       }
+      return;
     }
 
     session.handleEthernetFrame(data);
@@ -2338,6 +2247,9 @@ const adminServer = http.createServer((req, res) => {
         vmMAC: session.vmMAC,
         bytesSent: session.bytesSent,
         bytesReceived: session.bytesReceived,
+        udpFlowCount: session.udpFlows.size,
+        udpDroppedPackets: session.udpFlows.droppedPackets,
+        udpSendErrors: session.udpFlows.sendErrors,
         nickname: session.nickname,
       });
     });

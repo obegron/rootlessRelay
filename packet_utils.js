@@ -35,6 +35,52 @@ function ipv4Bytes(address) {
   return Buffer.from(octets);
 }
 
+function formatIPv4(ipPacket, offset) {
+  return `${ipPacket[offset]}.${ipPacket[offset + 1]}.` +
+    `${ipPacket[offset + 2]}.${ipPacket[offset + 3]}`;
+}
+
+function parseIPv4Packet(ipPacket) {
+  if (!Buffer.isBuffer(ipPacket) || ipPacket.length < 20) return null;
+
+  const version = ipPacket[0] >>> 4;
+  const headerLength = (ipPacket[0] & 0x0f) * 4;
+  if (version !== 4 || headerLength < 20 || ipPacket.length < headerLength) {
+    return null;
+  }
+
+  const totalLength = ipPacket.readUInt16BE(2);
+  if (totalLength < headerLength || totalLength > ipPacket.length) return null;
+
+  const fragmentField = ipPacket.readUInt16BE(6);
+  return {
+    packet: ipPacket.subarray(0, totalLength),
+    headerLength,
+    totalLength,
+    protocol: ipPacket[9],
+    srcIP: formatIPv4(ipPacket, 12),
+    dstIP: formatIPv4(ipPacket, 16),
+    moreFragments: (fragmentField & 0x2000) !== 0,
+    fragmentOffset: fragmentField & 0x1fff,
+  };
+}
+
+function parseUDPDatagram(ipPacket, parsed = parseIPv4Packet(ipPacket)) {
+  if (!parsed || parsed.protocol !== 17) return null;
+  const udpOffset = parsed.headerLength;
+  if (parsed.packet.length < udpOffset + 8) return null;
+
+  const length = parsed.packet.readUInt16BE(udpOffset + 4);
+  if (length < 8 || udpOffset + length > parsed.packet.length) return null;
+
+  return {
+    srcPort: parsed.packet.readUInt16BE(udpOffset),
+    dstPort: parsed.packet.readUInt16BE(udpOffset + 2),
+    length,
+    payload: parsed.packet.subarray(udpOffset + 8, udpOffset + length),
+  };
+}
+
 function buildIPv4Packet(
   payload,
   srcIP,
@@ -101,6 +147,8 @@ function udpChecksum(ipPacket) {
 module.exports = {
   buildIPv4Packet,
   internetChecksum,
+  parseIPv4Packet,
+  parseUDPDatagram,
   tcpChecksum,
   udpChecksum,
 };

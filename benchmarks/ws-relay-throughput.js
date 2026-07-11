@@ -2,11 +2,11 @@
 "use strict";
 
 const { spawn } = require("node:child_process");
-const dgram = require("node:dgram");
 const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
 const { performance } = require("node:perf_hooks");
+const { Worker } = require("node:worker_threads");
 const WebSocket = require("ws");
 const {
   buildIPv4Packet,
@@ -60,8 +60,9 @@ function parseArgs(args) {
   return options;
 }
 
-function buildUdpEthernetFrame(payloadSize, destinationPort) {
+function buildUdpEthernetFrame(payloadSize, destinationPort, marker = 0) {
   const payload = Buffer.alloc(payloadSize, 0xa5);
+  payload[0] = marker;
   const udp = Buffer.alloc(8 + payload.length);
   udp.writeUInt16BE(40000, 0);
   udp.writeUInt16BE(destinationPort, 2);
@@ -80,16 +81,6 @@ function buildUdpEthernetFrame(payloadSize, destinationPort) {
   return frame;
 }
 
-function listen(socket, port = 0) {
-  return new Promise((resolve, reject) => {
-    socket.once("error", reject);
-    socket.bind(port, "127.0.0.1", () => {
-      socket.removeListener("error", reject);
-      resolve(socket.address().port);
-    });
-  });
-}
-
 function freeTcpPort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -99,6 +90,95 @@ function freeTcpPort() {
       server.close((error) => error ? reject(error) : resolve(port));
     });
   });
+}
+
+class UdpReceiver {
+  constructor(receiveBufferBytes) {
+    this.nextRequestId = 1;
+    this.requests = new Map();
+    this.terminalError = null;
+    this.closing = false;
+    this.worker = new Worker(path.join(__dirname, "udp-receiver-worker.js"), {
+      workerData: { receiveBufferBytes },
+    });
+    this.ready = new Promise((resolve, reject) => {
+      this.resolveReady = resolve;
+      this.rejectReady = reject;
+    });
+    this.worker.on("message", (message) => {
+      if (message.ready) {
+        this.resolveReady(message.ready);
+        return;
+      }
+      if (message.error) {
+        const error = new Error(`UDP receiver worker: ${message.error}`);
+        this.fail(error);
+        return;
+      }
+      const request = this.requests.get(message.id);
+      if (!request) return;
+      this.requests.delete(message.id);
+      request.resolve(message.result);
+    });
+    this.worker.once("error", (error) => {
+      this.fail(error);
+    });
+    this.worker.once("exit", (code) => {
+      if (!this.closing) {
+        this.fail(new Error(`UDP receiver worker exited unexpectedly (${code})`));
+      }
+    });
+  }
+
+  fail(error) {
+    if (this.terminalError) return;
+    this.terminalError = error;
+    this.rejectReady(error);
+    for (const request of this.requests.values()) request.reject(error);
+    this.requests.clear();
+  }
+
+  request(command, extra = {}) {
+    return new Promise((resolve, reject) => {
+      if (this.terminalError) {
+        reject(this.terminalError);
+        return;
+      }
+      if (this.closing) {
+        reject(new Error("UDP receiver worker is closing"));
+        return;
+      }
+      const id = this.nextRequestId++;
+      this.requests.set(id, { resolve, reject });
+      try {
+        this.worker.postMessage({ id, command, ...extra });
+      } catch (error) {
+        this.requests.delete(id);
+        reject(error);
+      }
+    });
+  }
+
+  reset(payloadSize, marker) {
+    return this.request("reset", { size: payloadSize, phaseMarker: marker });
+  }
+
+  stats() {
+    return this.request("stats");
+  }
+
+  stop() {
+    return this.request("stop");
+  }
+
+  async close() {
+    if (this.closing) return;
+    this.closing = true;
+    const error = new Error("UDP receiver worker closed");
+    for (const request of this.requests.values()) request.reject(error);
+    this.requests.clear();
+    await this.worker.terminate();
+  }
 }
 
 function delay(ms) {
@@ -135,7 +215,12 @@ async function waitForRelay(url, child) {
   throw new Error(`Timed out waiting for relay: ${lastError?.message || "unknown error"}`);
 }
 
-async function sendFor(ws, frame, durationMs, bufferBytes) {
+async function sendFor(
+  ws,
+  frame,
+  durationMs,
+  bufferBytes,
+) {
   const start = performance.now();
   const deadline = start + durationMs;
   let sentPackets = 0;
@@ -155,21 +240,6 @@ async function sendFor(ws, frame, durationMs, bufferBytes) {
   }
 
   return { sentPackets, start, sendEnd: performance.now() };
-}
-
-async function waitForDrain(ws, getLastReceivedAt) {
-  const deadline = performance.now() + 3000;
-  let previousReceivedAt = getLastReceivedAt();
-
-  while (performance.now() < deadline) {
-    await delay(25);
-    const receivedAt = getLastReceivedAt();
-    const quietFor = receivedAt === 0 ? Infinity : performance.now() - receivedAt;
-    if (ws.bufferedAmount === 0 && receivedAt === previousReceivedAt && quietFor >= 100) {
-      return;
-    }
-    previousReceivedAt = receivedAt;
-  }
 }
 
 function getRelayBytes(adminPort) {
@@ -196,6 +266,36 @@ function getRelayBytes(adminPort) {
   });
 }
 
+async function waitForReceiverIdle(receiver, expectedPackets = null) {
+  const deadline = performance.now() + 3000;
+  let stats = await receiver.stats();
+  let unchangedPolls = 0;
+  let observedAt = performance.now();
+
+  while (performance.now() < deadline) {
+    await delay(25);
+    const current = await receiver.stats();
+    if (current.totalReceivedPackets === stats.totalReceivedPackets) {
+      unchangedPolls++;
+    } else {
+      unchangedPolls = 0;
+      observedAt = performance.now();
+    }
+    stats = current;
+    if (expectedPackets !== null && stats.receivedPackets > expectedPackets) {
+      throw new Error(
+        `UDP receiver counted ${stats.receivedPackets} packets; expected at most ` +
+        `${expectedPackets}`,
+      );
+    }
+    if (stats.receivedPackets === expectedPackets || unchangedPolls >= 4) {
+      return { ...stats, observedAt };
+    }
+  }
+
+  throw new Error("Timed out waiting for UDP receiver to become idle");
+}
+
 async function waitForRelayIdle(ws, adminPort) {
   const deadline = performance.now() + 5000;
   let bytes = await getRelayBytes(adminPort);
@@ -217,54 +317,80 @@ async function waitForRelayIdle(ws, adminPort) {
     }
   }
 
-  return { bytes, lastChangedAt };
+  throw new Error("Timed out waiting for WebSocket relay to become idle");
 }
 
 async function runCase(
   ws,
-  udpSocket,
+  receiver,
   destinationPort,
   adminPort,
   options,
   payloadSize,
+  marker = 1,
 ) {
-  const frame = buildUdpEthernetFrame(payloadSize, destinationPort);
+  const warmupFrame = buildUdpEthernetFrame(payloadSize, destinationPort, 0);
+  const frame = buildUdpEthernetFrame(payloadSize, destinationPort, marker);
 
-  await sendFor(ws, frame, options.warmupMs, options.bufferBytes);
+  await sendFor(
+    ws,
+    warmupFrame,
+    options.warmupMs,
+    options.bufferBytes,
+  );
   const baseline = await waitForRelayIdle(ws, adminPort);
+  await waitForReceiverIdle(receiver);
+  await receiver.reset(payloadSize, marker);
 
-  let receivedPackets = 0;
-  let receivedBytes = 0;
-  let lastReceivedAt = 0;
-  const onMessage = (message) => {
-    if (message.length !== payloadSize) return;
-    receivedPackets++;
-    receivedBytes += message.length;
-    lastReceivedAt = performance.now();
-  };
-  udpSocket.on("message", onMessage);
-
-  const sent = await sendFor(ws, frame, options.durationMs, options.bufferBytes);
+  const sent = await sendFor(
+    ws,
+    frame,
+    options.durationMs,
+    options.bufferBytes,
+  );
   const processed = await waitForRelayIdle(ws, adminPort);
-  await waitForDrain(ws, () => lastReceivedAt);
-  udpSocket.removeListener("message", onMessage);
 
   const relayedBytes = processed.bytes - baseline.bytes;
-  const relayedPackets = Math.round(relayedBytes / frame.length);
-  const end = Math.max(sent.sendEnd, processed.lastChangedAt, lastReceivedAt);
+  if (relayedBytes % frame.length !== 0) {
+    throw new Error(
+      `Relay byte accounting (${relayedBytes}) is not divisible by frame size ` +
+      `(${frame.length})`,
+    );
+  }
+  const relayedPackets = relayedBytes / frame.length;
+  if (relayedPackets !== sent.sentPackets) {
+    throw new Error(
+      `WebSocket accounting mismatch: sent ${sent.sentPackets}, relay processed ` +
+      `${relayedPackets}`,
+    );
+  }
+
+  await waitForReceiverIdle(receiver, relayedPackets);
+  const receiverStats = await receiver.stop();
+  if (receiverStats.receivedPackets > relayedPackets) {
+    throw new Error("UDP receiver counted more packets than the relay processed");
+  }
+  const end = Math.max(
+    sent.sendEnd,
+    processed.lastChangedAt,
+    receiverStats.lastReceivedAt,
+  );
   const elapsedSeconds = (end - sent.start) / 1000;
   return {
     payloadBytes: payloadSize,
     sentPackets: sent.sentPackets,
     relayedPackets,
-    receivedPackets,
+    receivedPackets: receiverStats.receivedPackets,
     lossPercent: relayedPackets === 0
       ? 0
-      : ((relayedPackets - receivedPackets) / relayedPackets) * 100,
+      : ((relayedPackets - receiverStats.receivedPackets) / relayedPackets) * 100,
+    webSocketLossPercent: sent.sentPackets === 0
+      ? 0
+      : ((sent.sentPackets - relayedPackets) / sent.sentPackets) * 100,
     relayedPacketsPerSecond: relayedPackets / elapsedSeconds,
     relayedPayloadBytesPerSecond: (relayedPackets * payloadSize) / elapsedSeconds,
-    deliveredPacketsPerSecond: receivedPackets / elapsedSeconds,
-    deliveredPayloadBytesPerSecond: receivedBytes / elapsedSeconds,
+    deliveredPacketsPerSecond: receiverStats.receivedPackets / elapsedSeconds,
+    deliveredPayloadBytesPerSecond: receiverStats.receivedBytes / elapsedSeconds,
     elapsedMs: elapsedSeconds * 1000,
   };
 }
@@ -282,14 +408,15 @@ function stopChild(child) {
 }
 
 async function runBenchmark(options) {
-  const udpSocket = dgram.createSocket("udp4");
-  const destinationPort = await listen(udpSocket);
-  udpSocket.on("message", () => {});
+  const receiver = new UdpReceiver(4 * 1024 * 1024);
+  let receiverInfo;
   try {
-    udpSocket.setRecvBufferSize(4 * 1024 * 1024);
-  } catch {
-    // Some platforms cap or do not expose socket buffer tuning.
+    receiverInfo = await receiver.ready;
+  } catch (error) {
+    await receiver.close();
+    throw error;
   }
+  const destinationPort = receiverInfo.port;
   const wsPort = await freeTcpPort();
   const adminPort = await freeTcpPort();
   const child = spawn(process.execPath, [path.join(ROOT, "relay.js")], {
@@ -318,9 +445,25 @@ async function runBenchmark(options) {
   try {
     ws = await waitForRelay(`ws://127.0.0.1:${wsPort}`, child);
     const results = [];
+    let marker = 1;
+    const markerState = {
+      next() {
+        const value = marker;
+        marker = marker === 255 ? 1 : marker + 1;
+        return value;
+      },
+    };
     for (const size of options.sizes) {
       results.push(
-        await runCase(ws, udpSocket, destinationPort, adminPort, options, size),
+        await runCase(
+          ws,
+          receiver,
+          destinationPort,
+          adminPort,
+          options,
+          size,
+          markerState.next(),
+        ),
       );
     }
     return {
@@ -328,6 +471,7 @@ async function runBenchmark(options) {
       durationMs: options.durationMs,
       warmupMs: options.warmupMs,
       bufferBytes: options.bufferBytes,
+      receiveBufferBytes: receiverInfo.receiveBufferBytes,
       results,
     };
   } catch (error) {
@@ -337,7 +481,7 @@ async function runBenchmark(options) {
     throw error;
   } finally {
     if (ws && ws.readyState !== WebSocket.CLOSED) ws.close();
-    udpSocket.close();
+    await receiver.close();
     await stopChild(child);
   }
 }
@@ -352,6 +496,9 @@ function printReport(report) {
     `Warmup ${report.warmupMs} ms, send window ${report.durationMs} ms, ` +
     `WS high-water mark ${report.bufferBytes} B`,
   );
+  if (report.receiveBufferBytes !== null) {
+    console.log(`UDP receive buffer ${report.receiveBufferBytes} B (isolated worker)`);
+  }
   console.log("");
   console.log("PAYLOAD       RELAYED/S     RELAY RATE       UDP RATE   UDP LOSS");
   for (const result of report.results) {

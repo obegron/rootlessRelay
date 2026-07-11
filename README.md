@@ -38,6 +38,8 @@ These default values can be overridden by setting corresponding environment vari
 | `DHCP_END`           | The ending IP address for the DHCP pool (last octet).      | `254`                      |
 | `DNS_SERVER_IP`      | DNS server provided to VMs via DHCP.                       | `8.8.8.8`                  |
 | `TCP_WINDOW_SIZE`    | TCP window size for connections to/from the VM.            | `10240`                    |
+| `UDP_FLOW_IDLE_TIMEOUT_MS` | Idle lifetime of a UDP flow mapping.                  | `30000`                    |
+| `MAX_UDP_FLOWS_PER_SESSION` | Maximum concurrent UDP flows per VM session.          | `256`                      |
 | `WS_PORT`            | Port for the WebSocket server.                             | `8443` (WSS) / `8086` (WS) |
 | `WS_BIND_ADDRESS`    | IP address for the WebSocket server to bind to.            | `0.0.0.0`                  |
 | `ADMIN_PORT`         | Port for the web-based admin interface.                    | `8001`                     |
@@ -122,9 +124,16 @@ npm run bench:ws
 ```
 
 This starts a temporary loopback relay, sends Ethernet/IPv4/UDP frames through
-WebSocket, and reports the payload received by a local UDP socket. Packet loss is
-reported because it indicates that the WebSocket or kernel UDP queues have been
-driven past their sustainable rate. Payloads above 1400 bytes are synthetic
-jumbo-frame stress cases; use the reported standard-MTU reference for ordinary
-Ethernet. Customize it with `--duration-ms`, `--buffer-bytes`, `--sizes`, or
-`--json`.
+WebSocket, and reports the payload received by an isolated-worker UDP socket.
+Separating the sender and receiver event loops prevents the load generator from
+creating its own receive loss. Packet loss is still reported when strict
+sent/relayed/received accounting detects it. Payloads above 1400 bytes are
+synthetic jumbo-frame stress cases; use the reported standard-MTU reference for
+ordinary Ethernet. Customize it with `--duration-ms`, `--buffer-bytes`,
+`--sizes`, or `--json`.
+
+The real-socket UDP flow collision test is opt-in:
+
+```bash
+npm run test:network
+```

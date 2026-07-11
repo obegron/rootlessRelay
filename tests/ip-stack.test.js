@@ -5,6 +5,8 @@ const assert = require("node:assert/strict");
 const {
   buildIPv4Packet,
   internetChecksum,
+  parseIPv4Packet,
+  parseUDPDatagram,
   tcpChecksum,
   udpChecksum,
 } = require("../packet_utils");
@@ -77,6 +79,103 @@ test("buildIPv4Packet creates a valid minimum IPv4 header", () => {
   assert.deepEqual([...packet.subarray(16, 20)], [10, 0, 2, 15]);
   assert.equal(internetChecksum(packet.subarray(0, 20)), 0);
   assert.deepEqual(packet.subarray(20), payload);
+});
+
+test("parseIPv4Packet trims Ethernet padding and exposes header metadata", () => {
+  const packet = buildIPv4Packet(
+    Buffer.from("payload"),
+    "192.0.2.1",
+    "198.51.100.2",
+    17,
+    9,
+  );
+  const padded = Buffer.concat([packet, Buffer.alloc(18, 0xaa)]);
+  const parsed = parseIPv4Packet(padded);
+
+  assert.equal(parsed.headerLength, 20);
+  assert.equal(parsed.totalLength, packet.length);
+  assert.equal(parsed.protocol, 17);
+  assert.equal(parsed.srcIP, "192.0.2.1");
+  assert.equal(parsed.dstIP, "198.51.100.2");
+  assert.equal(parsed.moreFragments, false);
+  assert.equal(parsed.fragmentOffset, 0);
+  assert.deepEqual(parsed.packet, packet);
+});
+
+test("parseIPv4Packet accepts options and reports fragmentation", () => {
+  const base = buildIPv4Packet(Buffer.alloc(8), "10.0.2.15", "10.0.2.2", 1, 1);
+  const packet = addIPv4Options(base, Buffer.from([1, 1, 1, 0]));
+  packet.writeUInt16BE(0x2001, 6);
+
+  const parsed = parseIPv4Packet(packet);
+  assert.equal(parsed.headerLength, 24);
+  assert.equal(parsed.moreFragments, true);
+  assert.equal(parsed.fragmentOffset, 1);
+});
+
+test("parseIPv4Packet rejects malformed versions and lengths", () => {
+  assert.equal(parseIPv4Packet(Buffer.alloc(19)), null);
+
+  const wrongVersion = Buffer.alloc(20);
+  wrongVersion[0] = 0x65;
+  wrongVersion.writeUInt16BE(20, 2);
+  assert.equal(parseIPv4Packet(wrongVersion), null);
+
+  const shortIhl = Buffer.from(wrongVersion);
+  shortIhl[0] = 0x44;
+  assert.equal(parseIPv4Packet(shortIhl), null);
+
+  const truncatedOptions = Buffer.from(wrongVersion);
+  truncatedOptions[0] = 0x46;
+  assert.equal(parseIPv4Packet(truncatedOptions), null);
+
+  const totalShorterThanHeader = Buffer.alloc(24);
+  totalShorterThanHeader[0] = 0x46;
+  totalShorterThanHeader.writeUInt16BE(20, 2);
+  assert.equal(parseIPv4Packet(totalShorterThanHeader), null);
+
+  const totalLongerThanPacket = Buffer.alloc(20);
+  totalLongerThanPacket[0] = 0x45;
+  totalLongerThanPacket.writeUInt16BE(21, 2);
+  assert.equal(parseIPv4Packet(totalLongerThanPacket), null);
+});
+
+test("parseUDPDatagram honors IPv4 options, UDP length, and padding", () => {
+  const udp = Buffer.alloc(12);
+  udp.writeUInt16BE(40000, 0);
+  udp.writeUInt16BE(53, 2);
+  udp.writeUInt16BE(11, 4);
+  Buffer.from("dns").copy(udp, 8);
+  udp[11] = 0xaa;
+
+  const base = buildIPv4Packet(udp, "10.0.2.15", "8.8.8.8", 17, 1);
+  const packet = addIPv4Options(base, Buffer.from([1, 1, 1, 0]));
+  const datagram = parseUDPDatagram(packet);
+
+  assert.equal(datagram.srcPort, 40000);
+  assert.equal(datagram.dstPort, 53);
+  assert.equal(datagram.length, 11);
+  assert.deepEqual(datagram.payload, Buffer.from("dns"));
+});
+
+test("parseUDPDatagram rejects wrong protocols and malformed lengths", () => {
+  const tcp = buildIPv4Packet(Buffer.alloc(20), "10.0.2.15", "10.0.2.2", 6);
+  assert.equal(parseUDPDatagram(tcp), null);
+
+  const shortHeader = buildIPv4Packet(Buffer.alloc(7), "10.0.2.15", "8.8.8.8", 17);
+  assert.equal(parseUDPDatagram(shortHeader), null);
+
+  const invalidLength = buildIPv4Packet(
+    Buffer.from("9c40003500070000", "hex"),
+    "10.0.2.15",
+    "8.8.8.8",
+    17,
+  );
+  assert.equal(parseUDPDatagram(invalidLength), null);
+
+  const truncated = Buffer.from(invalidLength);
+  truncated.writeUInt16BE(20, 24);
+  assert.equal(parseUDPDatagram(truncated), null);
 });
 
 test("buildIPv4Packet accepts zero and maximum payload boundaries", () => {
