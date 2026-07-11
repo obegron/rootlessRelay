@@ -7,7 +7,7 @@
     "start": "node relay.js",
     "keygen": "openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes",
     "test": "node --test tests/*.test.js",
-    "test:network": "RUN_NETWORK_TESTS=1 node --test tests/udp-flow-network.test.js",
+    "test:network": "RUN_NETWORK_TESTS=1 node --test tests/*-network.test.js",
     "bench:ip-stack": "node benchmarks/ip-stack-throughput.js",
     "bench:ws": "node benchmarks/ws-relay-throughput.js"
   },

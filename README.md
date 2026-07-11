@@ -14,6 +14,8 @@ A WebSocket based VPN/proxy relay for virtual machines.
 - **HTTP Proxying:** Reverse proxy functionality to expose services from VMs to
   the host network.
 - **Rate Limiting:** Configurable bandwidth limits for each connected VM.
+- **TCP Loss Recovery:** Fast retransmit plus backed-off retransmission timeouts
+  for handshakes, data, and connection teardown in both relay directions.
 
 ## Configuration
 
@@ -40,6 +42,9 @@ These default values can be overridden by setting corresponding environment vari
 | `TCP_WINDOW_SIZE`    | TCP window size for connections to/from the VM.            | `10240`                    |
 | `UDP_FLOW_IDLE_TIMEOUT_MS` | Idle lifetime of a UDP flow mapping.                  | `30000`                    |
 | `MAX_UDP_FLOWS_PER_SESSION` | Maximum concurrent UDP flows per VM session.          | `256`                      |
+| `TCP_RTO_INITIAL_MS` | Initial TCP retransmission timeout.                            | `1000`                     |
+| `TCP_RTO_MAX_MS` | Maximum backed-off TCP retransmission timeout.                      | `60000`                    |
+| `TCP_RTO_MAX_RETRANSMISSIONS` | Retransmissions before a TCP connection is aborted.   | `4`                        |
 | `WS_PORT`            | Port for the WebSocket server.                             | `8443` (WSS) / `8086` (WS) |
 | `WS_BIND_ADDRESS`    | IP address for the WebSocket server to bind to.            | `0.0.0.0`                  |
 | `ADMIN_PORT`         | Port for the web-based admin interface.                    | `8001`                     |

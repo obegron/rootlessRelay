@@ -4,6 +4,7 @@ const net = require("net");
 const crypto = require("crypto");
 const { getReverseFlow } = require("./tcp_utils");
 const { SlidingWindowRateLimiter } = require("./rate_limiter");
+const { TCPRetransmissionQueue } = require("./tcp_retransmission");
 const { UDPFlowManager } = require("./udp_flow_manager");
 const {
   buildIPv4Packet,
@@ -113,6 +114,18 @@ const UDP_FLOW_IDLE_TIMEOUT_MS = process.env.UDP_FLOW_IDLE_TIMEOUT_MS
 const MAX_UDP_FLOWS_PER_SESSION = process.env.MAX_UDP_FLOWS_PER_SESSION
   ? parseInt(process.env.MAX_UDP_FLOWS_PER_SESSION, 10)
   : 256;
+
+const TCP_RTO_INITIAL_MS = process.env.TCP_RTO_INITIAL_MS
+  ? parseInt(process.env.TCP_RTO_INITIAL_MS, 10)
+  : 1000;
+
+const TCP_RTO_MAX_MS = process.env.TCP_RTO_MAX_MS
+  ? parseInt(process.env.TCP_RTO_MAX_MS, 10)
+  : 60000;
+
+const TCP_RTO_MAX_RETRANSMISSIONS = process.env.TCP_RTO_MAX_RETRANSMISSIONS
+  ? parseInt(process.env.TCP_RTO_MAX_RETRANSMISSIONS, 10)
+  : 4;
 
 // ==============================================================================
 // END OF CONFIGURATION
@@ -303,6 +316,123 @@ class VMSession {
     this.sendIPToVM(ip);
   }
 
+  initializeRetransmission(conn, initialSequence, isCurrent, onExhausted) {
+    conn.retransmission = new TCPRetransmissionQueue({
+      initialSequence,
+      initialRtoMs: TCP_RTO_INITIAL_MS,
+      maxRtoMs: TCP_RTO_MAX_MS,
+      maxRetransmissions: TCP_RTO_MAX_RETRANSMISSIONS,
+      onRetransmit: (segment, reason) => {
+        if (!isCurrent()) {
+          conn.retransmission.close();
+          return;
+        }
+        if (log_level >= LOG_LEVEL_DEBUG) {
+          console.log(
+            `TCP ${reason} retransmit seq=${segment.seq} ` +
+            `len=${segment.payload.length}`,
+          );
+        }
+        this.sendTCP(
+          conn,
+          segment.payload,
+          conn.tx.srcPort,
+          conn.tx.dstPort,
+          conn.tx.srcIP,
+          conn.tx.dstIP,
+          segment.flags,
+          { sequence: segment.seq, advanceSequence: false },
+        );
+      },
+      onExhausted,
+    });
+  }
+
+  sendTrackedTCP(conn, payload, flags = {}, options = {}) {
+    const segments = this.sendTCP(
+      conn,
+      payload,
+      conn.tx.srcPort,
+      conn.tx.dstPort,
+      conn.tx.srcIP,
+      conn.tx.dstIP,
+      flags,
+      options,
+    );
+    for (const segment of segments) conn.retransmission.track(segment);
+    return segments;
+  }
+
+  abortReverseConnection(connKey, conn, error, sendReset = true) {
+    if (this.reverseTcpConnections.get(connKey) !== conn) return;
+    if (sendReset && this.ws.readyState === WebSocket.OPEN) {
+      this.sendTCP(
+        conn,
+        Buffer.alloc(0),
+        conn.tx.srcPort,
+        conn.tx.dstPort,
+        conn.tx.srcIP,
+        conn.tx.dstIP,
+        { rst: true, ack: true },
+      );
+    }
+    conn.state = "CLOSED";
+    conn.retransmission?.close();
+    this.clearReverseConnTimer(connKey);
+    this.reverseTcpConnections.delete(connKey);
+    conn.upstream.destroy();
+    conn.downstream.destroy();
+    conn.onError?.(error);
+    this.recentlyClosed.add(connKey);
+    setTimeout(() => this.recentlyClosed.delete(connKey), 2000);
+  }
+
+  finishReverseConnection(connKey, conn) {
+    if (this.reverseTcpConnections.get(connKey) !== conn) return;
+    conn.state = "CLOSED";
+    conn.retransmission.close();
+    this.clearReverseConnTimer(connKey);
+    this.reverseTcpConnections.delete(connKey);
+    conn.downstream.end();
+    conn.upstream.destroy();
+    this.recentlyClosed.add(connKey);
+    setTimeout(() => this.recentlyClosed.delete(connKey), 2000);
+  }
+
+  abortTCPConnection(connKey, conn, error, sendReset = true) {
+    if (this.tcpConnections.get(connKey) !== conn) return;
+    conn.state = "CLOSED";
+    conn.retransmission?.close();
+    this.tcpConnections.delete(connKey);
+    if (sendReset && this.ws.readyState === WebSocket.OPEN) {
+      this.sendTCP(
+        conn,
+        Buffer.alloc(0),
+        conn.tx.srcPort,
+        conn.tx.dstPort,
+        conn.tx.srcIP,
+        conn.tx.dstIP,
+        { rst: true, ack: true },
+      );
+    }
+    conn.socket?.destroy();
+    if (log_level >= LOG_LEVEL_DEBUG && error) {
+      console.error(`TCP connection ${connKey} aborted: ${error.message}`);
+    }
+  }
+
+  finishTCPConnection(connKey, conn) {
+    if (this.tcpConnections.get(connKey) !== conn) return;
+    conn.state = "CLOSED";
+    conn.retransmission.close();
+    conn.socket?.end();
+    setTimeout(() => {
+      if (this.tcpConnections.get(connKey) === conn) {
+        this.tcpConnections.delete(connKey);
+      }
+    }, 2000);
+  }
+
   createTCPConnection(port) {
     return new Promise((resolve, reject) => {
       let srcPort;
@@ -326,34 +456,51 @@ class VMSession {
       const connKey = srcPort;
 
       const isn = Math.floor(Math.random() * 0xFFFFFFFF);
+      let promiseSettled = false;
       const conn = {
         state: "SYN_SENT",
         relayIsn: isn,
-        relaySeq: (isn + 1) >>> 0,
+        relaySeq: isn >>> 0,
         vmSeq: 0,
-        vmLastAck: (isn + 1) >>> 0,
+        vmLastAck: isn >>> 0,
         vmWindow: TCP_WINDOW_SIZE,
         vmWindowScale: 0,
         sendQueue: [],
-        inFlight: [],
         sending: false,
+        dupAckCount: 0,
         vmOutOfOrder: new Map(),
         idleTimer: null,
+        pendingFin: false,
+        finSent: false,
         srcPort,
         dstPort,
         srcIP,
         dstIP,
+        tx: { srcPort, dstPort, srcIP, dstIP },
         upstream: new PassThrough(),
         downstream: new PassThrough(),
-        onConnected: () =>
+        onConnected: () => {
+          if (promiseSettled) return;
+          promiseSettled = true;
           resolve({
             upstream: conn.upstream,
             downstream: conn.downstream,
             connKey: connKey,
-          }),
-        onError: (err) => reject(err),
+          });
+        },
+        onError: (err) => {
+          if (promiseSettled) return;
+          promiseSettled = true;
+          reject(err);
+        },
       };
       this.reverseTcpConnections.set(connKey, conn);
+      this.initializeRetransmission(
+        conn,
+        conn.relaySeq,
+        () => this.reverseTcpConnections.get(connKey) === conn,
+        (error) => this.abortReverseConnection(connKey, conn, error),
+      );
       this.bumpReverseConnActivity(connKey);
 
       conn.upstream.on("data", (data) => {
@@ -368,14 +515,16 @@ class VMSession {
       });
 
       conn.upstream.on("close", () => {
+        if (
+          this.reverseTcpConnections.get(connKey) !== conn ||
+          conn.state === "CLOSED"
+        ) return;
         this.bumpReverseConnActivity(connKey);
-        this.sendTCP(conn, Buffer.alloc(0), srcPort, dstPort, srcIP, dstIP, {
-          fin: true,
-          ack: true,
-        });
+        conn.pendingFin = true;
+        this.trySendReverseToVM(connKey);
       });
 
-      this.sendTCP(conn, Buffer.alloc(0), srcPort, dstPort, srcIP, dstIP, {
+      this.sendTrackedTCP(conn, Buffer.alloc(0), {
         syn: true,
       });
     });
@@ -457,7 +606,26 @@ class VMSession {
 
     this.bumpReverseConnActivity(connKey);
 
+    if (RST) {
+      if (log_level >= LOG_LEVEL_DEBUG) {
+        console.log(
+          `[REVERSE TCP] RST received, closing connection ${connKey}`,
+        );
+      }
+      this.abortReverseConnection(
+        connKey,
+        conn,
+        new Error("VM reset reverse TCP connection"),
+        false,
+      );
+      return;
+    }
+
     if (conn.state === "SYN_SENT" && SYN && ACK) {
+      const ackResult = conn.retransmission.acknowledge(ackNum);
+      if (ackResult.status !== "advanced" || conn.retransmission.hasOutstanding) {
+        return;
+      }
       let windowScale = 0;
       if (dataOffset > 20) {
         let optOffset = ihl + 20;
@@ -481,7 +649,7 @@ class VMSession {
 
       conn.state = "ESTABLISHED";
       conn.vmSeq = (seqNum + 1) >>> 0;
-      conn.vmLastAck = ackNum;
+      conn.vmLastAck = conn.retransmission.sndUna;
       conn.vmWindowScale = windowScale;
       conn.vmWindow = window << windowScale;
 
@@ -496,40 +664,55 @@ class VMSession {
       return;
     }
 
-    if (conn.state !== "ESTABLISHED") return;
+    if (conn.state === "SYN_SENT") return;
+
+    if (SYN && ACK) {
+      // Our final handshake ACK may have been lost. ACK a repeated SYN-ACK
+      // without changing established sequence state.
+      this.sendTCP(
+        conn,
+        Buffer.alloc(0),
+        reverseFlow.relaySrcPort,
+        reverseFlow.relayDstPort,
+        reverseFlow.relaySrcIP,
+        reverseFlow.relayDstIP,
+        { ack: true },
+      );
+      return;
+    }
+
+    if (
+      conn.state !== "ESTABLISHED" &&
+      conn.state !== "FIN_WAIT" &&
+      conn.state !== "CLOSING"
+    ) return;
 
     // Track peer receive window and acknowledged bytes for reverse stream writes.
     conn.vmWindow = window << (conn.vmWindowScale || 0);
     if (ACK) {
-      const acked = this.seqDiff(ackNum, conn.vmLastAck);
-      if (acked > 0) {
-        let remain = acked;
-        while (remain > 0 && conn.inFlight.length > 0) {
-          const seg = conn.inFlight[0];
-          if (seg.length <= remain) {
-            remain -= seg.length;
-            conn.inFlight.shift();
-          } else {
-            conn.inFlight[0] = seg.slice(remain);
-            remain = 0;
-          }
+      const ackResult = conn.retransmission.acknowledge(ackNum);
+      if (ackResult.status === "advanced") {
+        conn.dupAckCount = 0;
+        conn.vmLastAck = conn.retransmission.sndUna;
+        if (
+          conn.peerFin &&
+          conn.finSent &&
+          !conn.retransmission.hasOutstanding
+        ) {
+          this.finishReverseConnection(connKey, conn);
+          return;
         }
-        conn.vmLastAck = ackNum;
         this.trySendReverseToVM(connKey);
+      } else if (
+        ackResult.status === "duplicate" &&
+        conn.retransmission.hasOutstanding
+      ) {
+        conn.dupAckCount++;
+        if (conn.dupAckCount === 3) {
+          conn.retransmission.fastRetransmit();
+          conn.dupAckCount = 0;
+        }
       }
-    }
-
-    if (RST) {
-      if (log_level >= LOG_LEVEL_DEBUG) {
-        console.log(
-          `[REVERSE TCP] RST received, closing connection ${connKey}`,
-        );
-      }
-      conn.state = "CLOSED";
-      conn.downstream.end();
-      this.clearReverseConnTimer(connKey);
-      this.reverseTcpConnections.delete(connKey);
-      return; // Exit immediately
     }
 
     if (payload.length === 6) {
@@ -628,24 +811,26 @@ class VMSession {
         `[REVERSE TCP] [${this.vmIP}] FIN received, closing connection ${connKey}`,
       );
 
-      conn.state = "CLOSED";
-      conn.downstream.end();
-
-      // A FIN consumes a sequence number, so we increment our expected sequence number.
+      const finSequence = (seqNum + payload.length) >>> 0;
+      if (finSequence !== conn.vmSeq) {
+        this.sendTCP(conn, Buffer.alloc(0), reverseFlow.relaySrcPort, reverseFlow.relayDstPort, reverseFlow.relaySrcIP, reverseFlow.relayDstIP, {
+          ack: true,
+        });
+        return;
+      }
       conn.vmSeq = (conn.vmSeq + 1) >>> 0;
+      conn.peerFin = true;
+      conn.state = "CLOSING";
+      conn.downstream.end();
 
       // Send final ACK for the FIN. This uses the updated vmSeq.
       this.sendTCP(conn, Buffer.alloc(0), reverseFlow.relaySrcPort, reverseFlow.relayDstPort, reverseFlow.relaySrcIP, reverseFlow.relayDstIP, {
         ack: true,
       });
 
-      this.clearReverseConnTimer(connKey);
-      this.reverseTcpConnections.delete(connKey);
-      this.recentlyClosed.add(connKey);
-
-      setTimeout(() => {
-        this.recentlyClosed.delete(connKey);
-      }, 2000);
+      if (conn.finSent && !conn.retransmission.hasOutstanding) {
+        this.finishReverseConnection(connKey, conn);
+      }
     }
   }
 
@@ -894,6 +1079,13 @@ class VMSession {
     const connKey = `${srcPort}:${dstIP}:${dstPort}`;
 
     if (SYN && !ACK) {
+      const existing = this.tcpConnections.get(connKey);
+      if (existing) {
+        if (existing.state === "SYN_SENT") {
+          existing.retransmission.fastRetransmit();
+        }
+        return;
+      }
       if (log_level >= LOG_LEVEL_DEBUG) {
         console.log(`   Opening connection to ${dstIP}:${dstPort}`);
       }
@@ -918,17 +1110,29 @@ class VMSession {
         relaySeq: (isn + 1) >>> 0,
         vmSeq: (seqNum + 1) >>> 0,
         vmOutOfOrder: new Map(),
-        vmLastAck: (isn + 1) >>> 0,
+        vmLastAck: isn >>> 0,
         state: "SYN_SENT",
         sendQueue: [],
-        inFlight: [],
         vmWindow: Math.min(actualWindow, TCP_WINDOW_SIZE),
         vmWindowScale: windowScale,
         dupAckCount: 0,
-        retransmitTimeout: null,
-        lastAckTime: Date.now(),
+        pendingFin: false,
+        finSent: false,
+        peerFin: false,
+        tx: {
+          srcPort: dstPort,
+          dstPort: srcPort,
+          srcIP: dstIP,
+          dstIP: srcIP,
+        },
       };
       this.tcpConnections.set(connKey, conn);
+      this.initializeRetransmission(
+        conn,
+        conn.vmLastAck,
+        () => this.tcpConnections.get(connKey) === conn,
+        (error) => this.abortTCPConnection(connKey, conn, error),
+      );
 
       socket.on("data", (data) => {
         const c = this.tcpConnections.get(connKey);
@@ -953,10 +1157,12 @@ class VMSession {
         }
         const c = this.tcpConnections.get(connKey);
         if (c && c.state !== "CLOSED") {
-          c.state = "CLOSING";
-          this.sendTCP(c, Buffer.alloc(0), dstPort, srcPort, dstIP, srcIP, {
-            fin: true,
-            ack: true,
+          c.pendingFin = true;
+          this.trySendToVM(connKey, {
+            dstPort,
+            srcPort,
+            dstIP,
+            srcIP,
           });
         }
       });
@@ -967,14 +1173,16 @@ class VMSession {
         }
         const c = this.tcpConnections.get(connKey);
         if (c) {
-          this.sendTCP(c, Buffer.alloc(0), dstPort, srcPort, dstIP, srcIP, {
-            rst: true,
-          });
-          this.tcpConnections.delete(connKey);
+          this.abortTCPConnection(connKey, c, err);
         }
       });
 
-      this.sendSynAck(srcIP, srcPort, dstIP, dstPort, seqNum, conn.relayIsn);
+      this.sendTrackedTCP(
+        conn,
+        Buffer.alloc(0),
+        { syn: true, ack: true, windowSize: TCP_WINDOW_SIZE },
+        { sequence: conn.relayIsn, advanceSequence: false },
+      );
       return;
     }
 
@@ -990,41 +1198,35 @@ class VMSession {
     const actualWindow = window << (conn.vmWindowScale || 0);
     conn.vmWindow = Math.min(actualWindow, TCP_WINDOW_SIZE);
 
-    if (ACK) {
-      const acked = this.seqDiff(ackNum, conn.vmLastAck);
+    if (RST) {
+      if (log_level >= LOG_LEVEL_DEBUG) {
+        console.log(`   🛑 RST received, closing connection`);
+      }
+      this.abortTCPConnection(
+        connKey,
+        conn,
+        new Error("VM reset TCP connection"),
+        false,
+      );
+      return;
+    }
 
-      if (acked > 0) {
+    let ackResult = null;
+    if (ACK) {
+      ackResult = conn.retransmission.acknowledge(ackNum);
+      if (ackResult.status === "advanced") {
         if (log_level >= LOG_LEVEL_DEBUG) {
-          console.log(`   ✅ VM ACKed ${acked} bytes (to ${ackNum})`);
+          console.log(
+            `   ✅ VM ACKed ${ackResult.ackedDataBytes} data bytes (to ${ackNum})`,
+          );
         }
         conn.dupAckCount = 0;
-        conn.lastAckTime = Date.now();
-
-        let remain = acked;
-        while (remain > 0 && conn.inFlight.length > 0) {
-          const seg = conn.inFlight[0];
-          if (seg.length <= remain) {
-            remain -= seg.length;
-            conn.inFlight.shift();
-          } else {
-            conn.inFlight[0] = seg.slice(remain);
-            remain = 0;
-          }
-        }
-
-        conn.vmLastAck = ackNum;
-        if (conn.retransmitTimeout) {
-          clearTimeout(conn.retransmitTimeout);
-          conn.retransmitTimeout = null;
-        }
-        this.trySendToVM(connKey, {
-          dstPort,
-          srcPort,
-          dstIP,
-          srcIP,
-        });
-      } else if (acked === 0 && conn.inFlight.length > 0) {
-        conn.dupAckCount = (conn.dupAckCount || 0) + 1;
+        conn.vmLastAck = conn.retransmission.sndUna;
+      } else if (
+        ackResult.status === "duplicate" &&
+        conn.retransmission.hasOutstanding
+      ) {
+        conn.dupAckCount++;
         if (log_level >= LOG_LEVEL_DEBUG) {
           console.log(`   🔄 Duplicate ACK #${conn.dupAckCount} for ${ackNum}`);
         }
@@ -1032,12 +1234,7 @@ class VMSession {
           if (log_level >= LOG_LEVEL_DEBUG) {
             console.log(`   ⚡ Fast retransmit triggered`);
           }
-          this.retransmitFirst(connKey, {
-            dstPort,
-            srcPort,
-            dstIP,
-            srcIP,
-          });
+          conn.retransmission.fastRetransmit();
           conn.dupAckCount = 0;
         }
       }
@@ -1046,7 +1243,12 @@ class VMSession {
     const payloadOffset = ihl + dataOffset;
     const payload = ipPacket.slice(payloadOffset);
 
-    if (conn.state === "SYN_SENT" && ACK) {
+    if (conn.state === "SYN_SENT") {
+      if (
+        !ACK ||
+        ackResult?.status !== "advanced" ||
+        conn.retransmission.hasOutstanding
+      ) return;
       conn.state = "ESTABLISHED";
       if (log_level >= LOG_LEVEL_DEBUG) {
         console.log(`   🤝 Connection established: ${connKey}`);
@@ -1057,20 +1259,28 @@ class VMSession {
         ack: true,
       });
 
+      this.trySendToVM(connKey, { dstPort, srcPort, dstIP, srcIP });
+
       // Don't process payload here - v86 will retransmit it cleanly
       return;
     }
 
-    if (conn.state !== "ESTABLISHED") return;
+    if (
+      conn.state !== "ESTABLISHED" &&
+      conn.state !== "FIN_WAIT" &&
+      conn.state !== "CLOSING"
+    ) return;
 
-    if (RST) {
-      if (log_level >= LOG_LEVEL_DEBUG) {
-        console.log(`   🛑 RST received, closing connection`);
+    if (ackResult?.status === "advanced") {
+      if (
+        conn.peerFin &&
+        conn.finSent &&
+        !conn.retransmission.hasOutstanding
+      ) {
+        this.finishTCPConnection(connKey, conn);
+        return;
       }
-      if (conn.socket) conn.socket.destroy();
-      if (conn.retransmitTimeout) clearTimeout(conn.retransmitTimeout);
-      this.tcpConnections.delete(connKey);
-      return; // Exit immediately, don't process anything else
+      this.trySendToVM(connKey, { dstPort, srcPort, dstIP, srcIP });
     }
 
     // Check for 6-byte TCP stack artifacts EARLY (before any other processing)
@@ -1174,49 +1384,28 @@ class VMSession {
         console.log(`   Closing (FIN): ${connKey}`);
       }
 
-      // A FIN consumes a sequence number. We should only process it if it's the one we expect.
-      if (seqNum === conn.vmSeq) {
-        conn.vmSeq = (conn.vmSeq + 1) >>> 0;
+      const finSequence = (seqNum + payload.length) >>> 0;
+      if (finSequence !== conn.vmSeq) {
+        this.sendTCP(conn, Buffer.alloc(0), dstPort, srcPort, dstIP, srcIP, {
+          ack: true,
+        });
+        return;
       }
+      conn.vmSeq = (conn.vmSeq + 1) >>> 0;
 
       // Send ACK for the FIN.
       this.sendTCP(conn, Buffer.alloc(0), dstPort, srcPort, dstIP, srcIP, {
         ack: true,
       });
 
-      conn.state = "CLOSED";
+      conn.peerFin = true;
+      conn.state = "CLOSING";
       if (conn.socket) conn.socket.end();
-      if (conn.retransmitTimeout) clearTimeout(conn.retransmitTimeout);
-      setTimeout(() => this.tcpConnections.delete(connKey), 2000);
+      if (conn.finSent && !conn.retransmission.hasOutstanding) {
+        this.finishTCPConnection(connKey, conn);
+      }
       return;
     }
-  }
-
-  retransmitFirst(connKey, info) {
-    const conn = this.tcpConnections.get(connKey);
-    if (!conn || conn.inFlight.length === 0) return;
-
-    const {
-      dstPort,
-      srcPort,
-      dstIP,
-      srcIP,
-    } = info;
-    const segment = conn.inFlight[0];
-
-    if (log_level >= LOG_LEVEL_DEBUG) {
-      console.log(`   🔁 Retransmitting ${segment.length} bytes`);
-    }
-
-    const originalSeq = conn.relaySeq;
-    conn.relaySeq = conn.vmLastAck;
-
-    this.sendTCP(conn, segment, dstPort, srcPort, dstIP, srcIP, {
-      ack: true,
-      psh: true,
-    });
-
-    conn.relaySeq = originalSeq;
   }
 
   seqLessThan(a, b) {
@@ -1249,14 +1438,11 @@ class VMSession {
         console.log(`[REVERSE TCP] Idle timeout closing connection ${connKey}`);
       }
 
-      stale.state = "CLOSED";
-      stale.downstream.end();
-      stale.upstream.destroy();
-      this.reverseTcpConnections.delete(connKey);
-      this.recentlyClosed.add(connKey);
-      setTimeout(() => {
-        this.recentlyClosed.delete(connKey);
-      }, 2000);
+      this.abortReverseConnection(
+        connKey,
+        stale,
+        new Error("Reverse TCP connection timed out"),
+      );
     }, REVERSE_TCP_IDLE_TIMEOUT_MS);
   }
 
@@ -1268,9 +1454,32 @@ class VMSession {
     }
   }
 
+  maybeSendReverseFin(connKey, conn) {
+    if (
+      !conn.pendingFin ||
+      conn.finSent ||
+      conn.sendQueue.length > 0 ||
+      conn.retransmission.payloadBytesInFlight >= conn.vmWindow ||
+      this.reverseTcpConnections.get(connKey) !== conn
+    ) return;
+
+    conn.pendingFin = false;
+    conn.finSent = true;
+    conn.state = "FIN_WAIT";
+    this.sendTrackedTCP(conn, Buffer.alloc(0), { fin: true, ack: true });
+  }
+
   trySendReverseToVM(connKey) {
     const conn = this.reverseTcpConnections.get(connKey);
-    if (!conn || conn.sending || conn.state !== "ESTABLISHED") return;
+    if (
+      !conn ||
+      conn.sending ||
+      (
+        conn.state !== "ESTABLISHED" &&
+        conn.state !== "FIN_WAIT" &&
+        conn.state !== "CLOSING"
+      )
+    ) return;
 
     conn.sending = true;
     const MSS = 1460;
@@ -1278,6 +1487,7 @@ class VMSession {
     const sendNext = () => {
       if (conn.sendQueue.length === 0) {
         conn.sending = false;
+        this.maybeSendReverseFin(connKey, conn);
         return;
       }
 
@@ -1287,7 +1497,7 @@ class VMSession {
         return;
       }
 
-      const inFlightBytes = conn.inFlight.reduce((sum, seg) => sum + seg.length, 0);
+      const inFlightBytes = conn.retransmission.payloadBytesInFlight;
       const available = Math.max(0, conn.vmWindow - inFlightBytes);
       if (available === 0) {
         conn.sending = false;
@@ -1302,8 +1512,7 @@ class VMSession {
       }
 
       const chunk = data.slice(0, toSend);
-      conn.inFlight.push(chunk);
-      this.sendTCP(conn, chunk, conn.srcPort, conn.dstPort, conn.srcIP, conn.dstIP, {
+      this.sendTrackedTCP(conn, chunk, {
         ack: true,
         psh: true,
       });
@@ -1318,15 +1527,31 @@ class VMSession {
         setImmediate(sendNext);
       } else {
         conn.sending = false;
+        this.maybeSendReverseFin(connKey, conn);
       }
     };
 
     sendNext();
   }
 
+  maybeSendTCPFin(connKey, conn) {
+    if (
+      !conn.pendingFin ||
+      conn.finSent ||
+      conn.sendQueue.length > 0 ||
+      conn.retransmission.payloadBytesInFlight >= conn.vmWindow ||
+      this.tcpConnections.get(connKey) !== conn
+    ) return;
+
+    conn.pendingFin = false;
+    conn.finSent = true;
+    conn.state = "FIN_WAIT";
+    this.sendTrackedTCP(conn, Buffer.alloc(0), { fin: true, ack: true });
+  }
+
   trySendToVM(connKey, info) {
     const conn = this.tcpConnections.get(connKey);
-    if (!conn || conn.sending) return;
+    if (!conn || conn.sending || conn.state === "SYN_SENT") return;
 
     conn.sending = true;
 
@@ -1341,6 +1566,7 @@ class VMSession {
     const sendNext = () => {
       if (conn.sendQueue.length === 0) {
         conn.sending = false;
+        this.maybeSendTCPFin(connKey, conn);
         return;
       }
 
@@ -1355,10 +1581,7 @@ class VMSession {
         return;
       }
 
-      let inFlightBytes = conn.inFlight.reduce(
-        (sum, seg) => sum + seg.length,
-        0,
-      );
+      const inFlightBytes = conn.retransmission.payloadBytesInFlight;
       const available = Math.max(0, conn.vmWindow - inFlightBytes);
 
       if (available === 0) {
@@ -1394,9 +1617,7 @@ class VMSession {
         );
       }
 
-      conn.inFlight.push(chunk);
-
-      this.sendTCP(conn, chunk, dstPort, srcPort, dstIP, srcIP, {
+      this.sendTrackedTCP(conn, chunk, {
         ack: true,
         psh: true,
       });
@@ -1411,35 +1632,29 @@ class VMSession {
         setImmediate(sendNext);
       } else {
         conn.sending = false;
+        this.maybeSendTCPFin(connKey, conn);
       }
     };
 
     sendNext();
   }
 
-  sendSynAck(dstIP, dstPort, srcIP, srcPort, theirSeq, ourSeq) {
-    const tcp = Buffer.alloc(20);
-    tcp.writeUInt16BE(srcPort, 0);
-    tcp.writeUInt16BE(dstPort, 2);
-    tcp.writeUInt32BE(ourSeq, 4);
-    tcp.writeUInt32BE((theirSeq + 1) >>> 0, 8);
-    tcp[12] = 0x50;
-    tcp[13] = 0x12; // SYN+ACK
-    tcp.writeUInt16BE(TCP_WINDOW_SIZE, 14);
-    tcp.writeUInt16BE(0, 16);
-    tcp.writeUInt16BE(0, 18);
-
-    const ip = this.buildIP(tcp, srcIP, dstIP, 6);
-    const cksum = this.calcTCPChecksum(ip);
-    ip.writeUInt16BE(cksum, 20 + 16);
-
-    if (log_level >= LOG_LEVEL_DEBUG) console.log(`    Sending SYN-ACK`);
-    this.sendIPToVM(ip);
-  }
-
-  sendTCP(conn, payload, srcPort, dstPort, srcIP, dstIP, flags = {}) {
+  sendTCP(
+    conn,
+    payload,
+    srcPort,
+    dstPort,
+    srcIP,
+    dstIP,
+    flags = {},
+    options = {},
+  ) {
     const MSS = 1460; // Maximum Segment Size for TCP over Ethernet
     let offset = 0;
+    let sequence = options.sequence === undefined
+      ? conn.relaySeq
+      : options.sequence >>> 0;
+    const sentSegments = [];
 
     // This loop handles TCP segmentation if the payload is larger than the MSS.
     // It also handles zero-length payloads (like pure ACKs).
@@ -1469,12 +1684,12 @@ class VMSession {
 
       tcp.writeUInt16BE(srcPort, 0);
       tcp.writeUInt16BE(dstPort, 2);
-      tcp.writeUInt32BE(conn.relaySeq, 4);
+      tcp.writeUInt32BE(sequence, 4);
       tcp.writeUInt32BE(conn.vmSeq, 8);
       tcp[12] = 0x50; // Data Offset (5 words)
       tcp[13] = (ack ? 0x10 : 0) | (fin ? 0x01 : 0) | (rst ? 0x04 : 0) |
         (psh ? 0x08 : 0) | (syn ? 0x02 : 0);
-      tcp.writeUInt16BE(65535, 14); // Window Size
+      tcp.writeUInt16BE(flags.windowSize ?? 65535, 14); // Window Size
       tcp.writeUInt16BE(0, 16); // Checksum (placeholder)
       tcp.writeUInt16BE(0, 18); // Urgent Pointer
 
@@ -1483,9 +1698,17 @@ class VMSession {
       }
 
       // Increment the sequence number by the size of the chunk for the next segment.
-      const seqIncr = chunk.length + (fin || syn ? 1 : 0);
+      const seqIncr = chunk.length + (fin ? 1 : 0) + (syn ? 1 : 0);
       if (seqIncr > 0 && !rst) {
-        conn.relaySeq = (conn.relaySeq + seqIncr) >>> 0;
+        sentSegments.push({
+          seq: sequence,
+          payload: chunk,
+          flags: { ...segmentFlags },
+        });
+        sequence = (sequence + seqIncr) >>> 0;
+        if (options.advanceSequence !== false) {
+          conn.relaySeq = sequence;
+        }
       }
 
       const ip = this.buildIP(tcp, srcIP, dstIP, 6);
@@ -1499,6 +1722,8 @@ class VMSession {
         break;
       }
     }
+
+    return sentSegments;
   }
 
   buildIP(payload, srcIP, dstIP, protocol) {
@@ -1942,21 +2167,21 @@ class VMSession {
     */
 
     for (const [key, conn] of this.tcpConnections) {
+      conn.retransmission?.close();
       if (conn.socket) {
         conn.socket.destroy();
-      }
-      if (conn.retransmitTimeout) {
-        clearTimeout(conn.retransmitTimeout);
       }
     }
     this.tcpConnections.clear();
 
     for (const [key, conn] of this.reverseTcpConnections) {
+      conn.retransmission?.close();
       if (conn.idleTimer) {
         clearTimeout(conn.idleTimer);
       }
       conn.upstream.destroy();
       conn.downstream.destroy();
+      conn.onError?.(new Error("VM session closed"));
     }
     this.reverseTcpConnections.clear();
   }
@@ -2136,12 +2361,18 @@ async function startTcpForward(rule) {
           `[TCP PROXY] Local client disconnected from ${bindAddress}:${rule.host_port}`,
         );
         downstream.unpipe(localSocket);
-        targetSession.clearReverseConnTimer(connKey);
-        targetSession.reverseTcpConnections.delete(connKey);
+        const conn = targetSession.reverseTcpConnections.get(connKey);
+        if (conn) {
+          conn.localClosed = true;
+          conn.pendingFin = true;
+          targetSession.trySendReverseToVM(connKey);
+        }
       });
 
       localSocket.on("error", (err) => {
         console.error(`[TCP PROXY] Local client socket error: ${err.message}`);
+        const conn = targetSession.reverseTcpConnections.get(connKey);
+        if (conn) targetSession.abortReverseConnection(connKey, conn, err);
       });
 
       downstream.on("error", (err) => {
@@ -2411,12 +2642,14 @@ async function proxyRequest(req, res, rule) {
       if (finished) return;
       finished = true;
       if (responseTimeout) clearTimeout(responseTimeout);
-      targetSession.clearReverseConnTimer(connKey);
-      targetSession.reverseTcpConnections.delete(connKey);
-      targetSession.recentlyClosed.add(connKey);
-      setTimeout(() => {
-        targetSession.recentlyClosed.delete(connKey);
-      }, 5000);
+      const conn = targetSession.reverseTcpConnections.get(connKey);
+      if (conn) {
+        targetSession.abortReverseConnection(
+          connKey,
+          conn,
+          new Error("HTTP proxy request completed"),
+        );
+      }
       upstream.destroy();
       downstream.destroy();
     };
@@ -2569,12 +2802,14 @@ proxyServer.on("upgrade", async (req, socket, head) => {
     const cleanup = () => {
       if (closed) return;
       closed = true;
-      targetSession.clearReverseConnTimer(connKey);
-      targetSession.reverseTcpConnections.delete(connKey);
-      targetSession.recentlyClosed.add(connKey);
-      setTimeout(() => {
-        targetSession.recentlyClosed.delete(connKey);
-      }, 5000);
+      const conn = targetSession.reverseTcpConnections.get(connKey);
+      if (conn) {
+        targetSession.abortReverseConnection(
+          connKey,
+          conn,
+          new Error("Upgrade proxy connection closed"),
+        );
+      }
       upstream.destroy();
       downstream.destroy();
       socket.destroy();
