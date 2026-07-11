@@ -92,3 +92,39 @@ The server will start, and you can see log output in your console.
 ### 4. Admin UI
 
 The project includes a simple web-based admin UI. By default, it's available at `http://localhost:8001`.
+
+## IP-stack choke test
+
+Run the single-process packet construction and checksum benchmark with:
+
+```bash
+npm run bench:ip-stack
+```
+
+The benchmark reports packets per second, application-payload throughput, and
+IPv4 throughput for TCP and UDP across several payload sizes. It measures the
+CPU ceiling of the relay's packet-building hot path; it does not include
+WebSocket, kernel socket, rate limiting, or network I/O. TCP packets larger than
+the relay's 1460-byte MSS are synthetic stress cases; the separately reported
+`Production TCP MSS ceiling` is the relevant packet-building limit for TCP.
+Use longer samples or select cases with:
+
+```bash
+npm run bench:ip-stack -- --duration-ms=3000 --protocol=tcp --sizes=1460,8192,32768
+```
+
+Use `--json` to capture comparable results before and after an optimization.
+
+To include the real WebSocket ingress and relay UDP forwarding path, run:
+
+```bash
+npm run bench:ws
+```
+
+This starts a temporary loopback relay, sends Ethernet/IPv4/UDP frames through
+WebSocket, and reports the payload received by a local UDP socket. Packet loss is
+reported because it indicates that the WebSocket or kernel UDP queues have been
+driven past their sustainable rate. Payloads above 1400 bytes are synthetic
+jumbo-frame stress cases; use the reported standard-MTU reference for ordinary
+Ethernet. Customize it with `--duration-ms`, `--buffer-bytes`, `--sizes`, or
+`--json`.

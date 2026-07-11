@@ -3,6 +3,12 @@ const dgram = require("dgram");
 const net = require("net");
 const crypto = require("crypto");
 const { getReverseFlow } = require("./tcp_utils");
+const {
+  buildIPv4Packet,
+  internetChecksum,
+  tcpChecksum,
+  udpChecksum,
+} = require("./packet_utils");
 
 // ==============================================================================
 // CONFIGURATION
@@ -1493,61 +1499,15 @@ class VMSession {
   }
 
   buildIP(payload, srcIP, dstIP, protocol) {
-    const ipLen = 20 + payload.length;
-    const ip = Buffer.alloc(ipLen);
-
-    ip[0] = 0x45;
-    ip[1] = 0;
-    ip.writeUInt16BE(ipLen, 2);
-    ip.writeUInt16BE(Math.floor(Math.random() * 65535), 4);
-    ip.writeUInt16BE(0, 6);
-    ip[8] = 64;
-    ip[9] = protocol;
-
-    Buffer.from(srcIP.split(".").map(Number)).copy(ip, 12);
-    Buffer.from(dstIP.split(".").map(Number)).copy(ip, 16);
-
-    const ipCksum = this.calcChecksum(ip.slice(0, 20));
-    ip.writeUInt16BE(ipCksum, 10);
-
-    payload.copy(ip, 20);
-    return ip;
+    return buildIPv4Packet(payload, srcIP, dstIP, protocol);
   }
 
   calcTCPChecksum(ipPacket) {
-    const srcIP = ipPacket.slice(12, 16);
-    const dstIP = ipPacket.slice(16, 20);
-    const tcpLen = ipPacket.length - 20;
-    const tcp = ipPacket.slice(20);
-
-    const pseudo = Buffer.alloc(12 + tcpLen);
-    srcIP.copy(pseudo, 0);
-    dstIP.copy(pseudo, 4);
-    pseudo[8] = 0;
-    pseudo[9] = 6;
-    pseudo.writeUInt16BE(tcpLen, 10);
-    tcp.copy(pseudo, 12);
-    pseudo.writeUInt16BE(0, 12 + 16);
-
-    return this.calcChecksum(pseudo);
+    return tcpChecksum(ipPacket);
   }
 
   calcUDPChecksum(ipPacket) {
-    const srcIP = ipPacket.slice(12, 16);
-    const dstIP = ipPacket.slice(16, 20);
-    const udpLen = ipPacket.length - 20;
-    const udp = ipPacket.slice(20);
-
-    const pseudo = Buffer.alloc(12 + udpLen);
-    srcIP.copy(pseudo, 0);
-    dstIP.copy(pseudo, 4);
-    pseudo[8] = 0;
-    pseudo[9] = 17;
-    pseudo.writeUInt16BE(udpLen, 10);
-    udp.copy(pseudo, 12);
-    pseudo.writeUInt16BE(0, 12 + 6);
-
-    return this.calcChecksum(pseudo);
+    return udpChecksum(ipPacket);
   }
 
   handleICMP(ipPacket) {
@@ -2049,18 +2009,7 @@ class VMSession {
   }
 
   calcChecksum(data) {
-    let sum = 0;
-    for (let i = 0; i < data.length; i += 2) {
-      if (i + 1 < data.length) {
-        sum += (data[i] << 8) + data[i + 1];
-      } else {
-        sum += data[i] << 8;
-      }
-    }
-    while (sum >> 16) {
-      sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    return ~sum & 0xFFFF;
+    return internetChecksum(data);
   }
 
   close() {
