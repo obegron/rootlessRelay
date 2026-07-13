@@ -2,7 +2,11 @@ const WebSocket = require("ws");
 const dgram = require("dgram");
 const net = require("net");
 const crypto = require("crypto");
-const { getReverseFlow } = require("./tcp_utils");
+const {
+  getReverseFlow,
+  parseTCPOptions,
+  takeQueuedBytes,
+} = require("./tcp_utils");
 const { SlidingWindowRateLimiter } = require("./rate_limiter");
 const { TCPRetransmissionQueue } = require("./tcp_retransmission");
 const { UDPFlowManager } = require("./udp_flow_manager");
@@ -71,10 +75,55 @@ const DHCP_END = process.env.DHCP_END ? parseInt(process.env.DHCP_END, 10) : 254
 // ENV: DNS_SERVER_IP
 const DNS_SERVER_IP = process.env.DNS_SERVER_IP || "8.8.8.8";
 
+// VM_MTU: MTU of the private VM-to-relay link. The relay terminates TCP, so
+// this may be larger than the public Internet MTU when the virtual NIC accepts
+// jumbo frames. It is advertised through DHCP option 26 and TCP MSS options.
+// ENV: VM_MTU
+const VM_MTU = process.env.VM_MTU
+  ? parseInt(process.env.VM_MTU, 10)
+  : 1500;
+if (!Number.isInteger(VM_MTU) || VM_MTU < 576 || VM_MTU > 65535) {
+  throw new RangeError("VM_MTU must be an integer from 576 through 65535");
+}
+const TCP_MSS = VM_MTU - 40;
+const TCP_FALLBACK_MSS = 1460;
+
 // TCP_WINDOW_SIZE: The TCP window size used for connections to and from the VM.
 // A larger size may improve performance for high-latency connections.
 // ENV: TCP_WINDOW_SIZE
 const TCP_WINDOW_SIZE = process.env.TCP_WINDOW_SIZE ? parseInt(process.env.TCP_WINDOW_SIZE, 10) : 1024 * 10;
+
+// TCP_SEND_BURST_SEGMENTS: Maximum number of TCP segments sent toward a VM
+// before yielding for TCP_SEND_BURST_INTERVAL_MS. This prevents a large TCP
+// receive window from becoming one burst that overruns an emulated NIC queue.
+// ENV: TCP_SEND_BURST_SEGMENTS
+const TCP_SEND_BURST_SEGMENTS = process.env.TCP_SEND_BURST_SEGMENTS
+  ? Math.max(1, parseInt(process.env.TCP_SEND_BURST_SEGMENTS, 10))
+  : 3;
+
+// TCP_SEND_BURST_INTERVAL_MS: Delay between paced TCP bursts toward a VM.
+// ENV: TCP_SEND_BURST_INTERVAL_MS
+const TCP_SEND_BURST_INTERVAL_MS = process.env.TCP_SEND_BURST_INTERVAL_MS
+  ? Math.max(0, parseInt(process.env.TCP_SEND_BURST_INTERVAL_MS, 10))
+  : 6;
+
+// TCP_INITIAL_CWND_BYTES: Initial congestion window for new TCP connections.
+// Unlike the VM receive window, this grows from ACK feedback and shrinks on
+// loss so a large receive window cannot remain full of missing segments.
+// ENV: TCP_INITIAL_CWND_BYTES
+const TCP_INITIAL_CWND_BYTES = process.env.TCP_INITIAL_CWND_BYTES
+  ? Math.max(1460, parseInt(process.env.TCP_INITIAL_CWND_BYTES, 10))
+  : 10240;
+
+// TCP_SEND_QUEUE_HIGH_WATER_BYTES: Pause the real input stream after this much
+// data is queued behind the VM. It resumes below half of this value.
+// ENV: TCP_SEND_QUEUE_HIGH_WATER_BYTES
+const TCP_SEND_QUEUE_HIGH_WATER_BYTES = process.env.TCP_SEND_QUEUE_HIGH_WATER_BYTES
+  ? Math.max(1460, parseInt(process.env.TCP_SEND_QUEUE_HIGH_WATER_BYTES, 10))
+  : 1024 * 1024;
+const TCP_SEND_QUEUE_LOW_WATER_BYTES = Math.floor(
+  TCP_SEND_QUEUE_HIGH_WATER_BYTES / 2,
+);
 
 // WS_PORT: The port on which the WebSocket server will listen.
 // Defaults to 8443 for WSS and 8086 for WS.
@@ -219,7 +268,14 @@ console.log(
 );
 
 console.log(`Rate limit: ${RATE_LIMIT_KBPS} KB/s`);
+console.log(`VM MTU: ${VM_MTU} bytes (maximum TCP MSS: ${TCP_MSS} bytes)`);
 console.log(`TCP Window: ${TCP_WINDOW_SIZE} bytes`);
+console.log(
+  `TCP pacing: ${TCP_SEND_BURST_SEGMENTS} segments every ` +
+  `${TCP_SEND_BURST_INTERVAL_MS} ms`,
+);
+console.log(`TCP initial congestion window: ${TCP_INITIAL_CWND_BYTES} bytes`);
+console.log(`TCP send queue high water: ${TCP_SEND_QUEUE_HIGH_WATER_BYTES} bytes`);
 console.log(`DHCP Pool: 10.0.2.${DHCP_START} - 10.0.2.${DHCP_END}`);
 console.log(`VM-to-VM routing: ${ENABLE_VM_TO_VM ? "ENABLED" : "DISABLED"}`);
 
@@ -316,7 +372,143 @@ class VMSession {
     this.sendIPToVM(ip);
   }
 
+  onTCPCongestionLoss(conn, reason) {
+    const inFlight = conn.retransmission?.payloadBytesInFlight || 0;
+    if (inFlight === 0) return;
+
+    const mss = this.tcpMss(conn);
+    const threshold = Math.max(2 * mss, Math.floor(inFlight / 2));
+    conn.congestionThreshold = threshold;
+    conn.congestionWindow = reason === "timeout" ? mss : threshold;
+    conn.congestionRecoveryUntil = conn.retransmission.sndNxt;
+    conn.fastRetransmitAck = conn.retransmission.sndUna;
+
+    if (log_level >= LOG_LEVEL_DEBUG) {
+      console.log(
+        `   📉 TCP ${reason}: cwnd=${conn.congestionWindow} ` +
+        `ssthresh=${threshold} recover=${conn.congestionRecoveryUntil}`,
+      );
+    }
+  }
+
+  onTCPCongestionAck(conn, ackedDataBytes, ackNumber) {
+    if (ackedDataBytes <= 0) return;
+
+    if (conn.congestionRecoveryUntil !== null) {
+      const recoveryComplete =
+        ackNumber === conn.congestionRecoveryUntil ||
+        this.seqLessThan(conn.congestionRecoveryUntil, ackNumber);
+      if (!recoveryComplete) {
+        this.retransmitTCPRecoveryHead(conn);
+        return;
+      }
+      conn.congestionRecoveryUntil = null;
+      return;
+    }
+
+    const mss = this.tcpMss(conn);
+    const current = Math.max(mss, conn.congestionWindow || mss);
+    const increment = Math.max(
+      1,
+      Math.floor((mss * ackedDataBytes) / current),
+    );
+    conn.congestionWindow = Math.min(TCP_WINDOW_SIZE, current + increment);
+  }
+
+  retransmitTCPRecoveryHead(conn) {
+    const segment = conn.retransmission.oldest;
+    if (!segment) return false;
+    conn.fastRetransmitAck = conn.retransmission.sndUna;
+    if (log_level >= LOG_LEVEL_DEBUG) {
+      console.log(
+        `   🩹 TCP recovery retransmit seq=${segment.seq} ` +
+        `len=${segment.payload.length}`,
+      );
+    }
+    this.sendTCP(
+      conn,
+      segment.payload,
+      conn.tx.srcPort,
+      conn.tx.dstPort,
+      conn.tx.srcIP,
+      conn.tx.dstIP,
+      segment.flags,
+      { sequence: segment.seq, advanceSequence: false },
+    );
+    return true;
+  }
+
+  isTCPCongestionRecoveryActive(conn) {
+    if (conn.congestionRecoveryUntil === null) return false;
+    const acknowledged = conn.retransmission.sndUna;
+    if (
+      acknowledged === conn.congestionRecoveryUntil ||
+      this.seqLessThan(conn.congestionRecoveryUntil, acknowledged)
+    ) {
+      conn.congestionRecoveryUntil = null;
+      return false;
+    }
+    return true;
+  }
+
+  tcpMss(conn) {
+    return Math.max(
+      536,
+      Math.min(TCP_MSS, conn.sendMss || TCP_FALLBACK_MSS),
+    );
+  }
+
+  tcpSendLimit(conn) {
+    return Math.max(
+      0,
+      Math.min(
+        conn.vmWindow,
+        Math.floor(conn.congestionWindow || TCP_INITIAL_CWND_BYTES),
+      ),
+    );
+  }
+
+  enqueueTCPData(conn, data, source) {
+    conn.sendQueue.push(data);
+    conn.sendQueueBytes += data.length;
+    if (
+      !conn.sendSourcePaused &&
+      conn.sendQueueBytes >= TCP_SEND_QUEUE_HIGH_WATER_BYTES &&
+      typeof source?.pause === "function"
+    ) {
+      conn.sendSourcePaused = true;
+      source.pause();
+      if (log_level >= LOG_LEVEL_DEBUG) {
+        console.log(`   ⏸ TCP input paused at ${conn.sendQueueBytes} queued bytes`);
+      }
+    }
+  }
+
+  consumeTCPQueuedData(conn, bytes, source) {
+    conn.sendQueueBytes = Math.max(0, conn.sendQueueBytes - bytes);
+    if (
+      conn.sendSourcePaused &&
+      conn.sendQueueBytes <= TCP_SEND_QUEUE_LOW_WATER_BYTES &&
+      typeof source?.resume === "function"
+    ) {
+      conn.sendSourcePaused = false;
+      source.resume();
+      if (log_level >= LOG_LEVEL_DEBUG) {
+        console.log(`   ▶ TCP input resumed at ${conn.sendQueueBytes} queued bytes`);
+      }
+    }
+  }
+
   initializeRetransmission(conn, initialSequence, isCurrent, onExhausted) {
+    conn.congestionWindow = Math.min(
+      TCP_INITIAL_CWND_BYTES,
+      TCP_WINDOW_SIZE,
+    );
+    conn.congestionThreshold = TCP_WINDOW_SIZE;
+    conn.congestionRecoveryUntil = null;
+    conn.fastRetransmitAck = null;
+    conn.sendQueueBytes = 0;
+    conn.sendSourcePaused = false;
     conn.retransmission = new TCPRetransmissionQueue({
       initialSequence,
       initialRtoMs: TCP_RTO_INITIAL_MS,
@@ -327,6 +519,7 @@ class VMSession {
           conn.retransmission.close();
           return;
         }
+        this.onTCPCongestionLoss(conn, reason);
         if (log_level >= LOG_LEVEL_DEBUG) {
           console.log(
             `TCP ${reason} retransmit seq=${segment.seq} ` +
@@ -465,6 +658,7 @@ class VMSession {
         vmLastAck: isn >>> 0,
         vmWindow: TCP_WINDOW_SIZE,
         vmWindowScale: 0,
+        sendMss: TCP_MSS,
         sendQueue: [],
         sending: false,
         dupAckCount: 0,
@@ -510,7 +704,7 @@ class VMSession {
             `[UPSTREAM] Received ${data.length} bytes from client. Forwarding to VM.`,
           );
         }
-        conn.sendQueue.push(data);
+        this.enqueueTCPData(conn, data, conn.upstream);
         this.trySendReverseToVM(connKey);
       });
 
@@ -543,6 +737,7 @@ class VMSession {
     const ackNum = ipPacket.readUInt32BE(ihl + 8);
     const flags = ipPacket[ihl + 13];
     const dataOffset = (ipPacket[ihl + 12] >> 4) * 4;
+    if (dataOffset < 20 || ihl + dataOffset > ipPacket.length) return;
     const window = ipPacket.readUInt16BE(ihl + 14);
     const SYN = (flags & 0x02) !== 0;
     const ACK = (flags & 0x10) !== 0;
@@ -626,32 +821,20 @@ class VMSession {
       if (ackResult.status !== "advanced" || conn.retransmission.hasOutstanding) {
         return;
       }
-      let windowScale = 0;
-      if (dataOffset > 20) {
-        let optOffset = ihl + 20;
-        const optEnd = ihl + dataOffset;
-        while (optOffset < optEnd && optOffset < ipPacket.length) {
-          const kind = ipPacket[optOffset];
-          if (kind === 0) break;
-          if (kind === 1) {
-            optOffset++;
-            continue;
-          }
-          if (optOffset + 1 >= ipPacket.length) break;
-          const len = ipPacket[optOffset + 1];
-          if (len < 2 || optOffset + len > optEnd) break;
-          if (kind === 3 && len === 3) {
-            windowScale = ipPacket[optOffset + 2];
-          }
-          optOffset += len;
-        }
-      }
+      const tcpOptions = dataOffset > 20
+        ? parseTCPOptions(ipPacket, ihl + 20, ihl + dataOffset)
+        : {};
+      const windowScale = tcpOptions.windowScale || 0;
 
       conn.state = "ESTABLISHED";
       conn.vmSeq = (seqNum + 1) >>> 0;
       conn.vmLastAck = conn.retransmission.sndUna;
       conn.vmWindowScale = windowScale;
       conn.vmWindow = window << windowScale;
+      conn.sendMss = Math.min(
+        TCP_MSS,
+        tcpOptions.mss || TCP_FALLBACK_MSS,
+      );
 
       this.sendTCP(conn, Buffer.alloc(0), reverseFlow.relaySrcPort, reverseFlow.relayDstPort, reverseFlow.relaySrcIP, reverseFlow.relayDstIP, {
         ack: true,
@@ -693,7 +876,9 @@ class VMSession {
       const ackResult = conn.retransmission.acknowledge(ackNum);
       if (ackResult.status === "advanced") {
         conn.dupAckCount = 0;
+        conn.fastRetransmitAck = null;
         conn.vmLastAck = conn.retransmission.sndUna;
+        this.onTCPCongestionAck(conn, ackResult.ackedDataBytes, ackNum);
         if (
           conn.peerFin &&
           conn.finSent &&
@@ -709,7 +894,9 @@ class VMSession {
       ) {
         conn.dupAckCount++;
         if (conn.dupAckCount === 3) {
-          conn.retransmission.fastRetransmit();
+          if (conn.fastRetransmitAck !== ackNum) {
+            conn.retransmission.fastRetransmit();
+          }
           conn.dupAckCount = 0;
         }
       }
@@ -1029,6 +1216,7 @@ class VMSession {
     const ackNum = ipPacket.readUInt32BE(ihl + 8);
     const flags = ipPacket[ihl + 13];
     const dataOffset = (ipPacket[ihl + 12] >> 4) * 4;
+    if (dataOffset < 20 || ihl + dataOffset > ipPacket.length) return;
     const window = ipPacket.readUInt16BE(ihl + 14);
 
     const SYN = (flags & 0x02) !== 0;
@@ -1037,30 +1225,13 @@ class VMSession {
     const RST = (flags & 0x04) !== 0;
     const PSH = (flags & 0x08) !== 0;
 
-    // Parse TCP options for window scaling
-    let windowScale = 0;
-    if (SYN && dataOffset > 20) {
-      let optOffset = ihl + 20;
-      const optEnd = ihl + dataOffset;
-      while (optOffset < optEnd && optOffset < ipPacket.length) {
-        const kind = ipPacket[optOffset];
-        if (kind === 0) break; // End of options
-        if (kind === 1) { // NOP
-          optOffset++;
-          continue;
-        }
-        if (optOffset + 1 >= ipPacket.length) break;
-        const len = ipPacket[optOffset + 1];
-        if (len < 2 || optOffset + len > optEnd) break;
-
-        if (kind === 3 && len === 3) { // Window Scale
-          windowScale = ipPacket[optOffset + 2];
-          if (log_level >= LOG_LEVEL_DEBUG) {
-            console.log(`     Window scale: ${windowScale}`);
-          }
-        }
-        optOffset += len;
-      }
+    const tcpOptions = SYN && dataOffset > 20
+      ? parseTCPOptions(ipPacket, ihl + 20, ihl + dataOffset)
+      : {};
+    const windowScale = tcpOptions.windowScale || 0;
+    if (SYN && log_level >= LOG_LEVEL_DEBUG) {
+      if (tcpOptions.mss) console.log(`     VM MSS: ${tcpOptions.mss}`);
+      if (windowScale) console.log(`     Window scale: ${windowScale}`);
     }
 
     if (log_level >= LOG_LEVEL_DEBUG) {
@@ -1115,6 +1286,10 @@ class VMSession {
         sendQueue: [],
         vmWindow: Math.min(actualWindow, TCP_WINDOW_SIZE),
         vmWindowScale: windowScale,
+        sendMss: Math.min(
+          TCP_MSS,
+          tcpOptions.mss || TCP_FALLBACK_MSS,
+        ),
         dupAckCount: 0,
         pendingFin: false,
         finSent: false,
@@ -1142,7 +1317,7 @@ class VMSession {
             `   Received ${data.length} bytes from ${dstIP}:${dstPort}`,
           );
         }
-        c.sendQueue.push(data);
+        this.enqueueTCPData(c, data, c.socket);
         this.trySendToVM(connKey, {
           dstPort,
           srcPort,
@@ -1221,7 +1396,9 @@ class VMSession {
           );
         }
         conn.dupAckCount = 0;
+        conn.fastRetransmitAck = null;
         conn.vmLastAck = conn.retransmission.sndUna;
+        this.onTCPCongestionAck(conn, ackResult.ackedDataBytes, ackNum);
       } else if (
         ackResult.status === "duplicate" &&
         conn.retransmission.hasOutstanding
@@ -1231,10 +1408,12 @@ class VMSession {
           console.log(`   🔄 Duplicate ACK #${conn.dupAckCount} for ${ackNum}`);
         }
         if (conn.dupAckCount === 3) {
-          if (log_level >= LOG_LEVEL_DEBUG) {
-            console.log(`   ⚡ Fast retransmit triggered`);
+          if (conn.fastRetransmitAck !== ackNum) {
+            if (log_level >= LOG_LEVEL_DEBUG) {
+              console.log(`   ⚡ Fast retransmit triggered`);
+            }
+            conn.retransmission.fastRetransmit();
           }
-          conn.retransmission.fastRetransmit();
           conn.dupAckCount = 0;
         }
       }
@@ -1460,6 +1639,7 @@ class VMSession {
       conn.finSent ||
       conn.sendQueue.length > 0 ||
       conn.retransmission.payloadBytesInFlight >= conn.vmWindow ||
+      this.isTCPCongestionRecoveryActive(conn) ||
       this.reverseTcpConnections.get(connKey) !== conn
     ) return;
 
@@ -1469,11 +1649,37 @@ class VMSession {
     this.sendTrackedTCP(conn, Buffer.alloc(0), { fin: true, ack: true });
   }
 
+  notePacedTCPSegment(conn, resume) {
+    const now = Date.now();
+    if (
+      TCP_SEND_BURST_INTERVAL_MS > 0 &&
+      conn.pacingLastSentAt !== undefined &&
+      now - conn.pacingLastSentAt >= TCP_SEND_BURST_INTERVAL_MS
+    ) {
+      conn.pacingSegments = 0;
+    }
+
+    conn.pacingLastSentAt = now;
+    conn.pacingSegments = (conn.pacingSegments || 0) + 1;
+    if (conn.pacingSegments < TCP_SEND_BURST_SEGMENTS) return false;
+
+    conn.pacingSegments = 0;
+    conn.pacingBlocked = true;
+    conn.sending = false;
+    conn.pacingTimer = setTimeout(() => {
+      conn.pacingTimer = null;
+      conn.pacingBlocked = false;
+      resume();
+    }, TCP_SEND_BURST_INTERVAL_MS);
+    return true;
+  }
+
   trySendReverseToVM(connKey) {
     const conn = this.reverseTcpConnections.get(connKey);
     if (
       !conn ||
       conn.sending ||
+      conn.pacingBlocked ||
       (
         conn.state !== "ESTABLISHED" &&
         conn.state !== "FIN_WAIT" &&
@@ -1482,9 +1688,14 @@ class VMSession {
     ) return;
 
     conn.sending = true;
-    const MSS = 1460;
+    const MSS = this.tcpMss(conn);
 
     const sendNext = () => {
+      if (this.reverseTcpConnections.get(connKey) !== conn) {
+        conn.sending = false;
+        return;
+      }
+
       if (conn.sendQueue.length === 0) {
         conn.sending = false;
         this.maybeSendReverseFin(connKey, conn);
@@ -1498,32 +1709,36 @@ class VMSession {
       }
 
       const inFlightBytes = conn.retransmission.payloadBytesInFlight;
-      const available = Math.max(0, conn.vmWindow - inFlightBytes);
+      const sendLimit = this.tcpSendLimit(conn);
+      const available = this.isTCPCongestionRecoveryActive(conn)
+        ? 0
+        : Math.max(0, sendLimit - inFlightBytes);
       if (available === 0) {
         conn.sending = false;
         return;
       }
 
-      const data = conn.sendQueue[0];
-      const toSend = Math.min(MSS, data.length, available);
+      const toSend = Math.min(MSS, conn.sendQueueBytes, available);
       if (toSend <= 0) {
         conn.sending = false;
         return;
       }
 
-      const chunk = data.slice(0, toSend);
+      const chunk = takeQueuedBytes(conn.sendQueue, toSend);
       this.sendTrackedTCP(conn, chunk, {
         ack: true,
         psh: true,
       });
+      this.consumeTCPQueuedData(conn, toSend, conn.upstream);
 
-      if (toSend >= data.length) {
-        conn.sendQueue.shift();
-      } else {
-        conn.sendQueue[0] = data.slice(toSend);
-      }
+      if (
+        this.notePacedTCPSegment(
+          conn,
+          () => this.trySendReverseToVM(connKey),
+        )
+      ) return;
 
-      if (conn.sendQueue.length > 0) {
+      if (conn.sendQueue.length > 0 && available > toSend) {
         setImmediate(sendNext);
       } else {
         conn.sending = false;
@@ -1540,6 +1755,7 @@ class VMSession {
       conn.finSent ||
       conn.sendQueue.length > 0 ||
       conn.retransmission.payloadBytesInFlight >= conn.vmWindow ||
+      this.isTCPCongestionRecoveryActive(conn) ||
       this.tcpConnections.get(connKey) !== conn
     ) return;
 
@@ -1551,7 +1767,12 @@ class VMSession {
 
   trySendToVM(connKey, info) {
     const conn = this.tcpConnections.get(connKey);
-    if (!conn || conn.sending || conn.state === "SYN_SENT") return;
+    if (
+      !conn ||
+      conn.sending ||
+      conn.pacingBlocked ||
+      conn.state === "SYN_SENT"
+    ) return;
 
     conn.sending = true;
 
@@ -1561,9 +1782,14 @@ class VMSession {
       dstIP,
       srcIP,
     } = info;
-    const MSS = 1460;
+    const MSS = this.tcpMss(conn);
 
     const sendNext = () => {
+      if (this.tcpConnections.get(connKey) !== conn) {
+        conn.sending = false;
+        return;
+      }
+
       if (conn.sendQueue.length === 0) {
         conn.sending = false;
         this.maybeSendTCPFin(connKey, conn);
@@ -1582,20 +1808,30 @@ class VMSession {
       }
 
       const inFlightBytes = conn.retransmission.payloadBytesInFlight;
-      const available = Math.max(0, conn.vmWindow - inFlightBytes);
+      const sendLimit = this.tcpSendLimit(conn);
+      const available = this.isTCPCongestionRecoveryActive(conn)
+        ? 0
+        : Math.max(0, sendLimit - inFlightBytes);
 
       if (available === 0) {
         if (log_level >= LOG_LEVEL_DEBUG) {
-          console.log(`   🚫 Window full (${inFlightBytes} in flight)`);
+          console.log(
+            `   🚫 Send limit full (${inFlightBytes} in flight, ` +
+            `rwnd=${conn.vmWindow}, cwnd=${Math.floor(conn.congestionWindow)})`,
+          );
         }
         conn.sending = false;
         return;
       }
 
-      const data = conn.sendQueue[0];
-      const toSend = Math.min(MSS, data.length, available);
+      const toSend = Math.min(MSS, conn.sendQueueBytes, available);
 
       if (toSend === 0) {
+        conn.sending = false;
+        return;
+      }
+
+      if (toSend < MSS && inFlightBytes > 0 && !conn.pendingFin) {
         conn.sending = false;
         return;
       }
@@ -1609,11 +1845,13 @@ class VMSession {
         return;
       }
 
-      const chunk = data.slice(0, toSend);
+      const chunk = takeQueuedBytes(conn.sendQueue, toSend);
 
       if (log_level >= LOG_LEVEL_DEBUG) {
         console.log(
-          `    Sending ${chunk.length}B to VM (queue:${conn.sendQueue.length} inflight:${inFlightBytes} window:${conn.vmWindow})`,
+          `    Sending ${chunk.length}B to VM ` +
+          `(queued:${conn.sendQueueBytes}B inflight:${inFlightBytes} ` +
+          `rwnd:${conn.vmWindow} cwnd:${Math.floor(conn.congestionWindow)})`,
         );
       }
 
@@ -1622,11 +1860,14 @@ class VMSession {
         psh: true,
       });
 
-      if (toSend >= data.length) {
-        conn.sendQueue.shift();
-      } else {
-        conn.sendQueue[0] = data.slice(toSend);
-      }
+      this.consumeTCPQueuedData(conn, toSend, conn.socket);
+
+      if (
+        this.notePacedTCPSegment(
+          conn,
+          () => this.trySendToVM(connKey, info),
+        )
+      ) return;
 
       if (conn.sendQueue.length > 0 && available > toSend) {
         setImmediate(sendNext);
@@ -1649,7 +1890,7 @@ class VMSession {
     flags = {},
     options = {},
   ) {
-    const MSS = 1460; // Maximum Segment Size for TCP over Ethernet
+    const MSS = this.tcpMss(conn);
     let offset = 0;
     let sequence = options.sequence === undefined
       ? conn.relaySeq
@@ -1679,23 +1920,26 @@ class VMSession {
       }
 
       const { fin, rst, ack, psh, syn } = segmentFlags;
-      const tcpLen = 20 + chunk.length;
+      const tcpOptions = syn
+        ? Buffer.from([2, 4, TCP_MSS >>> 8, TCP_MSS & 0xff])
+        : Buffer.alloc(0);
+      const tcpHeaderLength = 20 + tcpOptions.length;
+      const tcpLen = tcpHeaderLength + chunk.length;
       const tcp = Buffer.alloc(tcpLen);
 
       tcp.writeUInt16BE(srcPort, 0);
       tcp.writeUInt16BE(dstPort, 2);
       tcp.writeUInt32BE(sequence, 4);
       tcp.writeUInt32BE(conn.vmSeq, 8);
-      tcp[12] = 0x50; // Data Offset (5 words)
+      tcp[12] = (tcpHeaderLength / 4) << 4;
       tcp[13] = (ack ? 0x10 : 0) | (fin ? 0x01 : 0) | (rst ? 0x04 : 0) |
         (psh ? 0x08 : 0) | (syn ? 0x02 : 0);
       tcp.writeUInt16BE(flags.windowSize ?? 65535, 14); // Window Size
       tcp.writeUInt16BE(0, 16); // Checksum (placeholder)
       tcp.writeUInt16BE(0, 18); // Urgent Pointer
 
-      if (chunk.length > 0) {
-        chunk.copy(tcp, 20);
-      }
+      tcpOptions.copy(tcp, 20);
+      if (chunk.length > 0) chunk.copy(tcp, tcpHeaderLength);
 
       // Increment the sequence number by the size of the chunk for the next segment.
       const seqIncr = chunk.length + (fin ? 1 : 0) + (syn ? 1 : 0);
@@ -2096,6 +2340,10 @@ class VMSession {
     dhcp[off++] = 4;
     Buffer.from(DNS_SERVER_IP.split(".").map(Number)).copy(dhcp, off);
     off += 4;
+    dhcp[off++] = 26;
+    dhcp[off++] = 2;
+    dhcp.writeUInt16BE(VM_MTU, off);
+    off += 2;
     dhcp[off++] = 255;
 
     const udpLen = 8 + off;

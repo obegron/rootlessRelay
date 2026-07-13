@@ -39,7 +39,12 @@ These default values can be overridden by setting corresponding environment vari
 | `DHCP_START`         | The starting IP address for the DHCP pool (last octet).    | `15`                       |
 | `DHCP_END`           | The ending IP address for the DHCP pool (last octet).      | `254`                      |
 | `DNS_SERVER_IP`      | DNS server provided to VMs via DHCP.                       | `8.8.8.8`                  |
+| `VM_MTU`             | VM-to-relay link MTU; also controls the negotiated TCP MSS. | `1500`                    |
 | `TCP_WINDOW_SIZE`    | TCP window size for connections to/from the VM.            | `10240`                    |
+| `TCP_SEND_BURST_SEGMENTS` | Maximum TCP segments sent to a VM per paced burst.    | `3`                        |
+| `TCP_SEND_BURST_INTERVAL_MS` | Delay between paced TCP bursts sent to a VM.        | `6`                        |
+| `TCP_INITIAL_CWND_BYTES` | Initial ACK-driven TCP congestion window.                | `10240`                    |
+| `TCP_SEND_QUEUE_HIGH_WATER_BYTES` | Pause the real input stream at this queued size. | `1048576`                  |
 | `UDP_FLOW_IDLE_TIMEOUT_MS` | Idle lifetime of a UDP flow mapping.                  | `30000`                    |
 | `MAX_UDP_FLOWS_PER_SESSION` | Maximum concurrent UDP flows per VM session.          | `256`                      |
 | `TCP_RTO_INITIAL_MS` | Initial TCP retransmission timeout.                            | `1000`                     |
@@ -136,6 +141,57 @@ sent/relayed/received accounting detects it. Payloads above 1400 bytes are
 synthetic jumbo-frame stress cases; use the reported standard-MTU reference for
 ordinary Ethernet. Customize it with `--duration-ms`, `--buffer-bytes`,
 `--sizes`, or `--json`.
+
+To measure the opposite, TCP-download direction without requiring a browser or
+VM image, run:
+
+```bash
+npm run bench:tcp-egress
+```
+
+This starts a real loopback TCP source and relay, then connects a fake VM over
+WebSocket. The fake VM completes the TCP handshake, validates received payload,
+and sends delayed cumulative ACKs. Its bounded fake NIC queue makes burst loss
+and retransmission visible. The defaults compare the relay's `10240`- and
+`65535`-byte TCP windows with a 20 ms ACK delay and an eight-packet receive
+queue. Use `--rx-queue-packets=0` to remove the artificial NIC queue limit, or
+customize the workload with `--duration-ms`, `--ack-delay-ms`, `--ack-every`,
+`--rx-service-ms`, `--send-burst-segments`, `--send-burst-interval-ms`,
+`--initial-cwnd-bytes`, `--tcp-mss`, `--windows`, or `--json`.
+
+### Experimental jumbo VM link
+
+The relay terminates TCP instead of forwarding Internet IP packets directly.
+That means only the private VM-to-relay link needs to support a larger MTU. To
+reduce WebSocket messages and virtual-NIC packets per byte, start the relay with
+an opt-in jumbo MTU, for example:
+
+```bash
+VM_MTU=9000 \
+TCP_WINDOW_SIZE=65535 \
+TCP_INITIAL_CWND_BYTES=17920 \
+TCP_SEND_BURST_SEGMENTS=3 \
+TCP_SEND_BURST_INTERVAL_MS=5 \
+node relay.js
+```
+
+`VM_MTU` is advertised with DHCP option 26 and as a TCP MSS option. Confirm the
+guest interface reports the requested MTU before testing a new TCP connection:
+
+```bash
+ip link show
+```
+
+If the DHCP client ignores the MTU option, set it explicitly inside the guest:
+
+```bash
+ip link set dev eth0 mtu 9000
+```
+
+Jumbo support depends on the browser VM's virtual NIC. If connectivity stalls,
+return to `VM_MTU=1500`. The default remains 1500, and the relay limits outbound
+segments to the MSS advertised by the guest, so a guest that advertises 1460
+will not receive jumbo TCP segments.
 
 The real-socket UDP flow collision test is opt-in:
 
