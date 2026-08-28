@@ -10,7 +10,11 @@
     "test:network": "RUN_NETWORK_TESTS=1 node --test tests/*-network.test.js",
     "bench:ip-stack": "node benchmarks/ip-stack-throughput.js",
     "bench:ws": "node benchmarks/ws-relay-throughput.js",
-    "bench:tcp-egress": "node benchmarks/tcp-egress-throughput.js"
+    "bench:tcp-egress": "node benchmarks/tcp-egress-throughput.js",
+    "bench:tcp-ingress": "node benchmarks/tcp-ingress-throughput.js",
+    "bench:tcp-compare": "node benchmarks/compare-tcp-egress.js",
+    "bench:tcp-ingress-compare": "node benchmarks/compare-tcp-egress.js --direction=ingress",
+    "bench:tcp-ceiling": "node benchmarks/compare-tcp-egress.js --windows=65535 --ack-delay-ms=0 --ack-every=1 --rx-queue-packets=0 --rx-service-ms=0 --pacing-mode=off --send-burst-segments=64 --send-burst-max-segments=64 --send-burst-interval-ms=0 --source-bytes=134217728"
   },
   "repository": {
     "type": "git",

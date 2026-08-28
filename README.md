@@ -41,10 +41,14 @@ These default values can be overridden by setting corresponding environment vari
 | `DNS_SERVER_IP`      | DNS server provided to VMs via DHCP.                       | `8.8.8.8`                  |
 | `VM_MTU`             | VM-to-relay link MTU; also controls the negotiated TCP MSS. | `1500`                    |
 | `TCP_WINDOW_SIZE`    | TCP window size for connections to/from the VM.            | `10240`                    |
-| `TCP_SEND_BURST_SEGMENTS` | Maximum TCP segments sent to a VM per paced burst.    | `3`                        |
-| `TCP_SEND_BURST_INTERVAL_MS` | Delay between paced TCP bursts sent to a VM.        | `6`                        |
+| `TCP_PACING_MODE`     | VM-bound pacing mode: `adaptive`, `fixed`, or `off`.       | `adaptive`                 |
+| `TCP_SEND_BURST_SEGMENTS` | Initial adaptive or exact fixed TCP burst.           | `3`                        |
+| `TCP_SEND_BURST_MAX_SEGMENTS` | Maximum burst used by adaptive pacing.           | `8`                        |
+| `TCP_SEND_BURST_INTERVAL_MS` | Delay between paced TCP bursts sent to a VM.       | `6`                        |
 | `TCP_INITIAL_CWND_BYTES` | Initial ACK-driven TCP congestion window.                | `10240`                    |
 | `TCP_SEND_QUEUE_HIGH_WATER_BYTES` | Pause the real input stream at this queued size. | `1048576`                  |
+| `TCP_ACK_EVERY_SEGMENTS` | VM upload segments per cumulative ACK.                  | `2`                        |
+| `TCP_ACK_DELAY_MS`    | Maximum delay before ACKing VM upload data.                 | `10`                       |
 | `UDP_FLOW_IDLE_TIMEOUT_MS` | Idle lifetime of a UDP flow mapping.                  | `30000`                    |
 | `MAX_UDP_FLOWS_PER_SESSION` | Maximum concurrent UDP flows per VM session.          | `256`                      |
 | `TCP_RTO_INITIAL_MS` | Initial TCP retransmission timeout.                            | `1000`                     |
@@ -157,7 +161,58 @@ and retransmission visible. The defaults compare the relay's `10240`- and
 queue. Use `--rx-queue-packets=0` to remove the artificial NIC queue limit, or
 customize the workload with `--duration-ms`, `--ack-delay-ms`, `--ack-every`,
 `--rx-service-ms`, `--send-burst-segments`, `--send-burst-interval-ms`,
-`--initial-cwnd-bytes`, `--tcp-mss`, `--windows`, or `--json`.
+`--send-burst-max-segments`, `--pacing-mode`, `--initial-cwnd-bytes`,
+`--tcp-mss`, `--source-bytes`, `--windows`, or `--json`.
+
+To benchmark TCP uploads from a fake VM through the relay to a real loopback
+TCP sink, run:
+
+```bash
+npm run bench:tcp-ingress
+```
+
+This direction checks byte integrity, cumulative-ACK frequency, maximum bytes
+in flight, and the relay's advertised receive window. Use `--sink-pause-ms` to
+exercise socket backpressure. Compare it to a Git revision with:
+
+```bash
+npm run bench:tcp-ingress-compare -- --baseline-ref=main --runs=5
+```
+
+For a repeatable comparison against a Git revision, run:
+
+```bash
+npm run bench:tcp-compare -- --baseline-ref=main --runs=5
+```
+
+The comparison extracts the baseline revision to a temporary directory and
+alternates baseline/current runs to reduce run-order bias. It reports median
+goodput and coefficient of variation; `--json` includes every sample plus loss,
+retransmission, and payload-validity counters. The benchmark driver remains in
+the current worktree for both candidates, so only the relay implementation is
+changed. Use `--relay-runtime=/path/to/runtime` to run both relay candidates on
+another compatible JavaScript runtime while keeping the Node.js driver fixed.
+For example, after installing Bun:
+
+```bash
+npm run bench:tcp-compare -- --relay-runtime=/usr/bin/bun --runs=5
+```
+
+The default comparison models a constrained VM receive path and is useful for
+detecting burst loss and recovery collapse. To measure the end-to-end TCP relay
+ceiling without the simulated NIC and ACK delays, run:
+
+```bash
+npm run bench:tcp-ceiling -- --runs=5 --duration-ms=2000
+```
+
+Ceiling runs use a larger finite source payload. If a candidate delivers all of
+it before the sample ends, the report warns that `--source-bytes` must be raised
+before treating the result as a throughput ceiling.
+
+Adaptive pacing starts conservatively, grows its burst after clean ACK progress,
+and halves it on detected loss. Fixed mode is useful for controlled experiments;
+off mode removes pacing timers while retaining a cooperative event-loop yield.
 
 ### Experimental jumbo VM link
 
