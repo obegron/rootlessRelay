@@ -2414,7 +2414,11 @@ class VMSession {
 
   sendToVM(data, callback) {
     if (this.ws.readyState === WebSocket.OPEN) {
-      corkForTurn(this.transportSocket);
+      // Preserve the wire timing of paced bursts. Deferring their flush can
+      // compress consecutive bursts at a constrained VM's receive queue.
+      if (TCP_PACING_MODE === "off" || TCP_SEND_BURST_INTERVAL_MS === 0) {
+        corkForTurn(this.transportSocket);
+      }
       this.ws.send(data, {
         binary: true,
       }, (err) => {
