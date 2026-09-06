@@ -27,7 +27,11 @@ class SlidingWindowRateLimiter {
     if (this.totalBytes + bytes > this.maxBytes) return false;
 
     if (bytes > 0) {
-      this.entries.push({ timestamp: now, bytes });
+      // Date.now has millisecond precision. Bytes accepted at the same
+      // timestamp expire together, so one entry preserves the exact limit.
+      const last = this.entries[this.entries.length - 1];
+      if (last && last.timestamp === now) last.bytes += bytes;
+      else this.entries.push({ timestamp: now, bytes });
       this.totalBytes += bytes;
     }
     return true;
@@ -43,7 +47,10 @@ class SlidingWindowRateLimiter {
       this.head++;
     }
 
-    if (this.head >= 1024 && this.head * 2 >= this.entries.length) {
+    if (this.head === this.entries.length) {
+      this.entries.length = 0;
+      this.head = 0;
+    } else if (this.head >= 1024 && this.head * 2 >= this.entries.length) {
       this.entries = this.entries.slice(this.head);
       this.head = 0;
     }

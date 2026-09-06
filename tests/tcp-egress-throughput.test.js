@@ -111,3 +111,24 @@ test("TCP egress benchmark rejects invalid workload options", () => {
   assert.throws(() => parseArgs(["--relay-runtime="]), /must not be empty/);
   assert.throws(() => parseArgs(["--other"]), /Unknown option/);
 });
+
+test("zero-delay fake-VM ACKs reach the wire immediately without a timer turn", () => {
+  const { EventEmitter } = require("node:events");
+  const { performance } = require("node:perf_hooks");
+  const { FakeVM } = require("../benchmarks/tcp-egress-throughput");
+  const ws = new EventEmitter();
+  const sent = [];
+  ws.readyState = 1;
+  ws.send = (frame) => sent.push(parseTCPFrame(frame));
+  const vm = new FakeVM(ws, parseArgs(["--ack-delay-ms=0", "--ack-every=1"]));
+  vm.remotePort = 443;
+  vm.scheduleAck(42, performance.now(), false);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].ack, 42);
+  assert.equal(vm.ackTimers.size, 0);
+  vm.scheduleAck(41, performance.now(), false);
+  assert.equal(sent.length, 1, "a stale cumulative ACK must still be suppressed");
+  vm.scheduleAck(42, performance.now(), true);
+  assert.equal(sent.length, 2, "a duplicate ACK used for recovery must still be sent");
+  vm.close();
+});

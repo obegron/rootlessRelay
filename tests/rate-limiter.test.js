@@ -61,3 +61,21 @@ test("sliding window limiter validates configuration and consumption", () => {
   assert.throws(() => limiter.tryConsume(-1), /non-negative/);
   assert.equal(limiter.tryConsume(0), true);
 });
+
+test("same-millisecond aggregation preserves exact expiration boundaries", () => {
+  let now = 0;
+  const limiter = new SlidingWindowRateLimiter(5000, 1000, () => now);
+  for (let i = 0; i < 2000; i++) assert.equal(limiter.tryConsume(1), true);
+  assert.equal(limiter.entries.length, 1);
+  now = 1;
+  assert.equal(limiter.tryConsume(3000), true);
+  assert.equal(limiter.tryConsume(1), false);
+  now = 1000;
+  assert.equal(limiter.usage, 3000);
+  assert.equal(limiter.tryConsume(2000), true);
+  assert.equal(limiter.tryConsume(1), false);
+  now = 1001;
+  assert.equal(limiter.usage, 2000);
+  now = 2000;
+  assert.equal(limiter.usage, 0);
+});

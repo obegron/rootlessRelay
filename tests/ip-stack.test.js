@@ -305,3 +305,46 @@ test("transport checksum rejects a truncated transport header", () => {
   const packet = buildIPv4Packet(Buffer.alloc(6), "10.0.2.2", "10.0.2.15", 17);
   assert.throws(() => udpChecksum(packet), /too short/);
 });
+
+test("transport checksum matches a byte-wise oracle without mutating packets", () => {
+  function reference(data) {
+    let sum = 0;
+    for (let i = 0; i < data.length; i += 2) {
+      sum += data[i] * 256 + (data[i + 1] || 0);
+      sum = (sum % 65536) + Math.floor(sum / 65536);
+    }
+    return 65535 - sum;
+  }
+  for (const [protocol, headerSize, field, checksum] of [[6, 20, 16, tcpChecksum], [17, 8, 6, udpChecksum]]) {
+    for (const optionBytes of [0, 4, 40]) {
+      for (const length of [0, 1, 2, 63, 64, 1459, 1460, 8191, 65535 - 20 - optionBytes - headerSize]) {
+        const transport = Buffer.alloc(headerSize + length);
+        for (let i = 0; i < transport.length; i++) transport[i] = (i * 131 + length) & 255;
+        const base = buildIPv4Packet(transport, "192.0.2.255", "198.51.100.255", protocol);
+        const packet = optionBytes ? addIPv4Options(base, Buffer.alloc(optionBytes, 1)) : base;
+        const before = Buffer.from(packet);
+        const pseudo = Buffer.alloc(12);
+        packet.copy(pseudo, 0, 12, 20);
+        pseudo[9] = protocol;
+        pseudo.writeUInt16BE(transport.length, 10);
+        const zeroed = Buffer.from(transport);
+        zeroed.writeUInt16BE(0, field);
+        assert.equal(checksum(packet), reference(Buffer.concat([pseudo, zeroed])));
+        assert.deepEqual(packet, before);
+      }
+    }
+  }
+});
+
+test("prepared IPv4 addresses produce independent, identical wire packets", () => {
+  const { ipv4Bytes } = require("../packet_utils");
+  const src = ipv4Bytes("192.0.2.1");
+  const dst = ipv4Bytes("198.51.100.2");
+  const payload = Buffer.from("payload");
+  const packet = buildIPv4Packet(payload, src, dst, 6, 42);
+  const expected = buildIPv4Packet(payload, "192.0.2.1", "198.51.100.2", 6, 42);
+  src.fill(0);
+  dst.fill(0);
+  assert.deepEqual(packet, expected);
+  assert.throws(() => buildIPv4Packet(payload, Buffer.alloc(3), dst, 6), /four bytes/);
+});

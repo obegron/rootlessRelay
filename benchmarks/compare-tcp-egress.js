@@ -232,7 +232,10 @@ async function runComparison(options) {
         relayAckEvery: options.benchmark.relayAckEvery,
         relayAckDelayMs: options.benchmark.relayAckDelayMs,
         sinkPauseMs: options.benchmark.sinkPauseMs,
+        sinkPauseCount: options.benchmark.sinkPauseCount === Infinity
+          ? null : options.benchmark.sinkPauseCount,
         relayRuntime: options.benchmark.relayRuntime,
+        relayCpuProfDir: options.benchmark.relayCpuProfDir,
       } : {
         durationMs: options.benchmark.durationMs,
         ackDelayMs: options.benchmark.ackDelayMs,
@@ -248,6 +251,7 @@ async function runComparison(options) {
         sourceBytes: options.benchmark.sourceBytes,
         windows: options.benchmark.windows,
         relayRuntime: options.benchmark.relayRuntime,
+        relayCpuProfDir: options.benchmark.relayCpuProfDir,
       },
       baseline,
       current,

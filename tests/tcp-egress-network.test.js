@@ -7,7 +7,7 @@ const {
 } = require("../benchmarks/tcp-egress-throughput");
 
 test(
-  "paced TCP egress uses a large window without oversized-burst collapse",
+  "fixed TCP pacing uses a large window without oversized-burst collapse",
   { skip: process.env.RUN_NETWORK_TESTS !== "1", timeout: 20000 },
   async () => {
     const report = await runBenchmark({
@@ -16,7 +16,12 @@ test(
       ackEvery: 2,
       rxQueuePackets: 8,
       rxServiceMs: 5,
+      // Keep headroom for scheduler jitter in this zero-loss assertion.
+      // Adaptive bursts can reach the entire eight-packet NIC capacity;
+      // their loss recovery is exercised separately below.
+      pacingMode: "fixed",
       sendBurstSegments: 3,
+      sendBurstMaxSegments: 3,
       sendBurstIntervalMs: 6,
       initialCwndBytes: 10240,
       windows: [10240, 65535],
@@ -115,5 +120,32 @@ test(
         `${standardResult.goodputBytesPerSecond} versus ` +
         `${jumboResult.goodputBytesPerSecond} bytes/s`,
     );
+  },
+);
+
+test(
+  "unpaced TCP egress resumes after batched WebSocket writes flush",
+  { skip: process.env.RUN_NETWORK_TESTS !== "1", timeout: 10000 },
+  async () => {
+    const report = await runBenchmark({
+      durationMs: 300,
+      ackDelayMs: 0,
+      ackEvery: 1,
+      rxQueuePackets: 0,
+      rxServiceMs: 0,
+      pacingMode: "off",
+      sendBurstSegments: 64,
+      sendBurstMaxSegments: 64,
+      sendBurstIntervalMs: 0,
+      initialCwndBytes: 65535,
+      tcpMss: 1460,
+      windows: [65535],
+      sourceBytes: 64 * 1024 * 1024,
+    });
+    const result = report.results[0];
+    assert.ok(result.deliveredBytes > 4 * 65535, "must advance beyond the initial window");
+    assert.equal(result.invalidPayloadSegments, 0);
+    assert.equal(result.droppedDataSegments, 0);
+    assert.equal(result.retransmittedSegments, 0);
   },
 );

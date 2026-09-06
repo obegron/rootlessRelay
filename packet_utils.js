@@ -19,6 +19,10 @@ function internetChecksum(data) {
 }
 
 function ipv4Bytes(address) {
+  if (Buffer.isBuffer(address)) {
+    if (address.length !== 4) throw new TypeError("IPv4 address must contain four bytes");
+    return address;
+  }
   if (typeof address !== "string") {
     throw new TypeError(`Invalid IPv4 address: ${address}`);
   }
@@ -121,19 +125,24 @@ function transportChecksum(ipPacket, protocol, checksumOffset) {
   }
 
   const transportLength = ipPacket.length - headerLength;
+  if (transportLength > 0xffff) throw new RangeError("Transport length exceeds 65535 bytes");
   if (transportLength < checksumOffset + 2) {
     throw new RangeError("Transport packet is too short for its checksum field");
   }
 
-  const pseudoPacket = Buffer.allocUnsafe(12 + transportLength);
-  ipPacket.copy(pseudoPacket, 0, 12, 20);
-  pseudoPacket[8] = 0;
-  pseudoPacket[9] = protocol;
-  pseudoPacket.writeUInt16BE(transportLength, 10);
-  ipPacket.copy(pseudoPacket, 12, headerLength);
-  pseudoPacket.writeUInt16BE(0, 12 + checksumOffset);
-
-  return internetChecksum(pseudoPacket);
+  // Sum the pseudo-header and transport in place. Subtract the existing
+  // checksum word rather than copying or mutating the packet to zero it.
+  let sum = protocol + transportLength;
+  for (let offset = 12; offset < 20; offset += 2) {
+    sum += ipPacket.readUInt16BE(offset);
+  }
+  sum -= ipPacket.readUInt16BE(headerLength + checksumOffset);
+  for (let offset = headerLength; offset + 1 < ipPacket.length; offset += 2) {
+    sum += ipPacket.readUInt16BE(offset);
+  }
+  if (transportLength % 2 !== 0) sum += ipPacket[ipPacket.length - 1] << 8;
+  while (sum > 0xffff) sum = (sum & 0xffff) + Math.floor(sum / 0x10000);
+  return (~sum) & 0xffff;
 }
 
 function tcpChecksum(ipPacket) {
@@ -147,6 +156,7 @@ function udpChecksum(ipPacket) {
 module.exports = {
   buildIPv4Packet,
   internetChecksum,
+  ipv4Bytes,
   parseIPv4Packet,
   parseUDPDatagram,
   tcpChecksum,

@@ -3,6 +3,7 @@ const dgram = require("dgram");
 const net = require("net");
 const crypto = require("crypto");
 const {
+  corkForTurn,
   getReverseFlow,
   parseTCPOptions,
   takeQueuedBytes,
@@ -14,6 +15,7 @@ const { UDPFlowManager } = require("./udp_flow_manager");
 const {
   buildIPv4Packet,
   internetChecksum,
+  ipv4Bytes,
   parseIPv4Packet,
   parseUDPDatagram,
   tcpChecksum,
@@ -334,11 +336,14 @@ console.log(`VM-to-VM routing: ${ENABLE_VM_TO_VM ? "ENABLED" : "DISABLED"}`);
 const PassThrough = require("stream").PassThrough;
 
 class VMSession {
-  constructor(ws, clientIP) {
+  constructor(ws, clientIP, transportSocket) {
     this.ws = ws;
+    this.transportSocket = transportSocket;
+    this.tcpTransportWaiters = new Map();
     this.clientIP = clientIP;
     this.vmIP = null;
     this.vmMAC = null;
+    this.vmMACBytes = null;
     this.bytesSent = 0;
     this.bytesReceived = 0;
 
@@ -553,6 +558,18 @@ class VMSession {
     }
   }
 
+  updateTCPWindow(conn, sequence, ack, window) {
+    if (conn.windowUpdateSeq !== undefined && (
+      this.seqLessThan(sequence, conn.windowUpdateSeq) ||
+      (sequence === conn.windowUpdateSeq && this.seqLessThan(ack, conn.windowUpdateAck))
+    )) return false;
+    const changed = conn.vmWindow !== window;
+    conn.vmWindow = window;
+    conn.windowUpdateSeq = sequence;
+    conn.windowUpdateAck = ack;
+    return changed;
+  }
+
   tcpReceiveWindow(conn) {
     if (conn.receiveBackpressured) return 0;
     const buffered = conn.vmOutOfOrderBytes || 0;
@@ -605,6 +622,9 @@ class VMSession {
 
   writeTCPReceiveData(conn, sink, payload) {
     if (!sink?.writable) return false;
+    // Coalesce packets received together into one socket writev. Uncork on
+    // nextTick so ACK/pacing timers never have to wait for a batching timer.
+    corkForTurn(sink);
     if (!sink.write(payload)) conn.receiveBackpressured = true;
     return true;
   }
@@ -616,6 +636,8 @@ class VMSession {
   }
 
   initializeRetransmission(conn, initialSequence, isCurrent, onExhausted) {
+    conn.tx.srcAddress = ipv4Bytes(conn.tx.srcIP);
+    conn.tx.dstAddress = ipv4Bytes(conn.tx.dstIP);
     conn.congestionWindow = Math.min(
       TCP_INITIAL_CWND_BYTES,
       TCP_WINDOW_SIZE,
@@ -696,6 +718,7 @@ class VMSession {
       );
     }
     conn.state = "CLOSED";
+    this.tcpTransportWaiters.delete(conn);
     conn.pacer?.close();
     this.clearDelayedTCPAck(conn);
     conn.retransmission?.close();
@@ -711,6 +734,7 @@ class VMSession {
   finishReverseConnection(connKey, conn) {
     if (this.reverseTcpConnections.get(connKey) !== conn) return;
     conn.state = "CLOSED";
+    this.tcpTransportWaiters.delete(conn);
     conn.pacer?.close();
     this.clearDelayedTCPAck(conn);
     conn.retransmission.close();
@@ -725,6 +749,7 @@ class VMSession {
   abortTCPConnection(connKey, conn, error, sendReset = true) {
     if (this.tcpConnections.get(connKey) !== conn) return;
     conn.state = "CLOSED";
+    this.tcpTransportWaiters.delete(conn);
     conn.pacer?.close();
     this.clearDelayedTCPAck(conn);
     conn.retransmission?.close();
@@ -749,6 +774,7 @@ class VMSession {
   finishTCPConnection(connKey, conn) {
     if (this.tcpConnections.get(connKey) !== conn) return;
     conn.state = "CLOSED";
+    this.tcpTransportWaiters.delete(conn);
     conn.pacer?.close();
     this.clearDelayedTCPAck(conn);
     conn.retransmission.close();
@@ -866,13 +892,13 @@ class VMSession {
     });
   }
 
-  handleReverseTCP(ipPacket) {
+  handleReverseTCP(ipPacket, parsed = parseIPv4Packet(ipPacket)) {
+    if (!parsed) return;
     const ihl = (ipPacket[0] & 0x0f) * 4;
 
     if (ipPacket.length < ihl + 20) return;
 
-    const srcIP = Array.from(ipPacket.slice(12, 16)).join(".");
-    const dstIP = Array.from(ipPacket.slice(16, 20)).join(".");
+    const { srcIP, dstIP } = parsed;
     const srcPort = ipPacket.readUInt16BE(ihl);
     const dstPort = ipPacket.readUInt16BE(ihl + 2);
     const seqNum = ipPacket.readUInt32BE(ihl + 4);
@@ -966,7 +992,7 @@ class VMSession {
       const tcpOptions = dataOffset > 20
         ? parseTCPOptions(ipPacket, ihl + 20, ihl + dataOffset)
         : {};
-      const windowScale = tcpOptions.windowScale || 0;
+      const windowScale = 0; // Our SYN does not offer window scaling.
 
       conn.state = "ESTABLISHED";
       conn.vmSeq = (seqNum + 1) >>> 0;
@@ -1003,9 +1029,10 @@ class VMSession {
     ) return;
 
     // Track peer receive window and acknowledged bytes for reverse stream writes.
-    conn.vmWindow = window << (conn.vmWindowScale || 0);
     if (ACK) {
       const ackResult = conn.retransmission.acknowledge(ackNum);
+      if (ackResult.status === "future" || ackResult.status === "stale") return;
+      const windowChanged = this.updateTCPWindow(conn, seqNum, ackNum, window);
       if (ackResult.status === "advanced") {
         conn.dupAckCount = 0;
         conn.fastRetransmitAck = null;
@@ -1022,6 +1049,8 @@ class VMSession {
         this.trySendReverseToVM(connKey);
       } else if (
         ackResult.status === "duplicate" &&
+        !windowChanged && !SYN && !FIN &&
+        ipPacket.length === ihl + dataOffset &&
         conn.retransmission.hasOutstanding
       ) {
         conn.dupAckCount++;
@@ -1032,23 +1061,9 @@ class VMSession {
           conn.dupAckCount = 0;
         }
       }
-    }
-
-    if (payload.length === 6) {
-      const allSpaces = payload.every((b) => b === 0x20);
-      const allZeros = payload.every((b) => b === 0);
-
-      if (allSpaces || allZeros) {
-        if (log_level >= LOG_LEVEL_TRACE) {
-          console.log(
-            `[R-TRACE] Ignoring 6-byte ${
-              allSpaces ? "spaces" : "zeros"
-            } artifact`,
-          );
-        }
-        // Don't update vmSeq, just ACK
-        this.scheduleTCPAck(conn, 0, true);
-        return;
+      if (windowChanged) {
+        conn.dupAckCount = 0;
+        this.trySendReverseToVM(connKey);
       }
     }
 
@@ -1157,12 +1172,12 @@ class VMSession {
       const srcMAC = frame.slice(6, 12);
       const etherType = frame.readUInt16BE(12);
 
-      const macStr = Array.from(srcMAC).map((b) =>
-        b.toString(16).padStart(2, "0")
-      ).join(":");
-
       // Store MAC address
-      if (!this.vmMAC || this.vmMAC !== macStr) {
+      if (!this.vmMACBytes || !this.vmMACBytes.equals(srcMAC)) {
+        this.vmMACBytes = Buffer.from(srcMAC);
+        const macStr = Array.from(srcMAC).map((b) =>
+          b.toString(16).padStart(2, "0")
+        ).join(":");
         this.vmMAC = macStr;
         if (log_level >= LOG_LEVEL_DEBUG) {
           console.log(`🔖 – VM MAC: ${macStr}`);
@@ -1286,7 +1301,7 @@ class VMSession {
 
     if (protocol === 6 && dstIP === GATEWAY_IP) {
       if (parsed.moreFragments || parsed.fragmentOffset !== 0) return;
-      this.handleReverseTCP(ipPacket);
+      this.handleReverseTCP(ipPacket, parsed);
       return;
     }
 
@@ -1328,15 +1343,15 @@ class VMSession {
     // Otherwise handle normally (internet-bound traffic)
     if (protocol === 1) this.handleICMP(ipPacket, parsed);
     else if (protocol === 17) this.handleUDP(ipPacket, parsed);
-    else if (protocol === 6) this.handleTCP(ipPacket);
+    else if (protocol === 6) this.handleTCP(ipPacket, parsed);
   }
 
-  handleTCP(ipPacket) {
+  handleTCP(ipPacket, parsed = parseIPv4Packet(ipPacket)) {
+    if (!parsed) return;
     const ihl = (ipPacket[0] & 0x0f) * 4;
     if (ipPacket.length < ihl + 20) return;
 
-    const srcIP = Array.from(ipPacket.slice(12, 16)).join(".");
-    const dstIP = Array.from(ipPacket.slice(16, 20)).join(".");
+    const { srcIP, dstIP } = parsed;
     const srcPort = ipPacket.readUInt16BE(ihl);
     const dstPort = ipPacket.readUInt16BE(ihl + 2);
     const seqNum = ipPacket.readUInt32BE(ihl + 4);
@@ -1355,7 +1370,7 @@ class VMSession {
     const tcpOptions = SYN && dataOffset > 20
       ? parseTCPOptions(ipPacket, ihl + 20, ihl + dataOffset)
       : {};
-    const windowScale = tcpOptions.windowScale || 0;
+    const windowScale = 0; // Our SYN-ACK does not offer window scaling.
     if (SYN && log_level >= LOG_LEVEL_DEBUG) {
       if (tcpOptions.mss) console.log(`     VM MSS: ${tcpOptions.mss}`);
       if (windowScale) console.log(`     Window scale: ${windowScale}`);
@@ -1504,10 +1519,6 @@ class VMSession {
       return;
     }
 
-    // Update window with scaling
-    const actualWindow = window << (conn.vmWindowScale || 0);
-    conn.vmWindow = Math.min(actualWindow, TCP_WINDOW_SIZE);
-
     if (RST) {
       if (log_level >= LOG_LEVEL_DEBUG) {
         console.log(`   🛑 RST received, closing connection`);
@@ -1522,8 +1533,11 @@ class VMSession {
     }
 
     let ackResult = null;
+    let windowChanged = false;
     if (ACK) {
       ackResult = conn.retransmission.acknowledge(ackNum);
+      if (ackResult.status === "future" || ackResult.status === "stale") return;
+      windowChanged = this.updateTCPWindow(conn, seqNum, ackNum, window);
       if (ackResult.status === "advanced") {
         if (log_level >= LOG_LEVEL_DEBUG) {
           console.log(
@@ -1536,6 +1550,8 @@ class VMSession {
         this.onTCPCongestionAck(conn, ackResult.ackedDataBytes, ackNum);
       } else if (
         ackResult.status === "duplicate" &&
+        !windowChanged && !SYN && !FIN &&
+        ipPacket.length === ihl + dataOffset &&
         conn.retransmission.hasOutstanding
       ) {
         conn.dupAckCount++;
@@ -1568,13 +1584,8 @@ class VMSession {
         console.log(`   🤝 Connection established: ${connKey}`);
       }
 
-      // Always ACK the handshake, but ignore any piggybacked data
+      // Complete the handshake, then process any data or FIN on this ACK.
       this.sendTCPAck(conn);
-
-      this.trySendToVM(connKey, { dstPort, srcPort, dstIP, srcIP });
-
-      // Don't process payload here - v86 will retransmit it cleanly
-      return;
     }
 
     if (
@@ -1583,7 +1594,7 @@ class VMSession {
       conn.state !== "CLOSING"
     ) return;
 
-    if (ackResult?.status === "advanced") {
+    if (ackResult?.status === "advanced" || windowChanged) {
       if (
         conn.peerFin &&
         conn.finSent &&
@@ -1592,31 +1603,8 @@ class VMSession {
         this.finishTCPConnection(connKey, conn);
         return;
       }
+      if (windowChanged) conn.dupAckCount = 0;
       this.trySendToVM(connKey, { dstPort, srcPort, dstIP, srcIP });
-    }
-
-    // Check for 6-byte TCP stack artifacts EARLY (before any other processing)
-    if (payload.length === 6) {
-      const allSpaces = payload.every((b) => b === 0x20);
-      const allZeros = payload.every((b) => b === 0);
-
-      if (allSpaces || allZeros) {
-        if (log_level >= LOG_LEVEL_DEBUG) {
-          console.log(
-            `   🔍 6-byte packet: ${
-              allSpaces ? "all spaces (0x20)" : "all zeros"
-            }`,
-          );
-          console.log(
-            `   ⚠️ Ignoring VM TCP stack artifact (6-byte ${
-              allSpaces ? "spaces" : "zeros"
-            })`,
-          );
-        }
-        // Don't forward, don't update vmSeq, just ACK with current state
-        this.scheduleTCPAck(conn, 0, true);
-        return; // ← Exit here, don't process FIN or anything else
-      }
     }
 
     if (payload.length > 0) {
@@ -1805,7 +1793,9 @@ class VMSession {
       }
       if (this.ws.bufferedAmount > 32768) {
         conn.sending = false;
-        setTimeout(resume, 20);
+        // A send completion wakes this connection once queued writes flush.
+        // Polling on a timer adds artificial stalls when writes are batched.
+        this.tcpTransportWaiters.set(conn, resume);
         return;
       }
 
@@ -1988,7 +1978,12 @@ class VMSession {
         }
       }
 
-      const ip = this.buildIP(tcp, srcIP, dstIP, 6);
+      const ip = this.buildIP(
+        tcp,
+        conn.tx?.srcIP === srcIP ? conn.tx.srcAddress : srcIP,
+        conn.tx?.dstIP === dstIP ? conn.tx.dstAddress : dstIP,
+        6,
+      );
       const cksum = this.calcTCPChecksum(ip);
       ip.writeUInt16BE(cksum, 20 + 16); // Write checksum in TCP header within IP packet
 
@@ -2395,9 +2390,8 @@ class VMSession {
     this.bytesSent += ipPacket.length;
     const frame = Buffer.alloc(14 + ipPacket.length);
 
-    if (this.vmMAC) {
-      const macBytes = this.vmMAC.split(":").map((hex) => parseInt(hex, 16));
-      Buffer.from(macBytes).copy(frame, 0);
+    if (this.vmMACBytes) {
+      this.vmMACBytes.copy(frame, 0);
     } else {
       frame.fill(0xff, 0, 6);
     }
@@ -2411,8 +2405,16 @@ class VMSession {
     this.sendToVM(frame, callback);
   }
 
+  resumeTCPTransportWaiters() {
+    if (this.tcpTransportWaiters.size === 0 || this.ws.bufferedAmount > 32768) return;
+    const resumes = [...this.tcpTransportWaiters.values()];
+    this.tcpTransportWaiters.clear();
+    for (const resume of resumes) setImmediate(resume);
+  }
+
   sendToVM(data, callback) {
     if (this.ws.readyState === WebSocket.OPEN) {
+      corkForTurn(this.transportSocket);
       this.ws.send(data, {
         binary: true,
       }, (err) => {
@@ -2420,6 +2422,7 @@ class VMSession {
           console.log(`   ❌ Error sending to VM: ${err.message}`);
         }
         if (callback) callback(err);
+        this.resumeTCPTransportWaiters();
       });
     } else {
       if (log_level >= LOG_LEVEL_DEBUG) {
@@ -2456,6 +2459,7 @@ class VMSession {
       }
     }
     this.tcpConnections.clear();
+    this.tcpTransportWaiters.clear();
 
     for (const [key, conn] of this.reverseTcpConnections) {
       conn.pacer?.close();
@@ -2498,7 +2502,7 @@ wss.on("connection", (ws, req) => {
   connectionsPerIP.set(clientIP, currentConnections + 1);
   console.log(`✅ New connection from ${clientIP}`);
 
-  const session = new VMSession(ws, clientIP);
+  const session = new VMSession(ws, clientIP, req.socket);
   const sessionId = crypto.randomUUID();
   activeSessions.set(sessionId, session);
 
@@ -2506,7 +2510,7 @@ wss.on("connection", (ws, req) => {
     if (!isBinary) {
       const str = data.toString();
       if (str.startsWith("ping:")) {
-        ws.send("pong:" + str.substring(5));
+        ws.send("pong:" + str.substring(5), () => session.resumeTCPTransportWaiters());
       }
       return;
     }

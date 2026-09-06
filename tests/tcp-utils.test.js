@@ -60,3 +60,48 @@ test("parseTCPOptions ignores undersized MSS and malformed tails", () => {
     /invalid TCP option bounds/,
   );
 });
+
+test("corkForTurn batches ordered writes and preserves backpressure", async () => {
+  const { Writable } = require("node:stream");
+  const { once } = require("node:events");
+  const { corkForTurn } = require("../tcp_utils");
+  const batches = [];
+  const stream = new Writable({
+    highWaterMark: 4,
+    write(chunk, encoding, callback) { batches.push([chunk]); callback(); },
+    writev(chunks, callback) { batches.push(chunks.map(({ chunk }) => chunk)); callback(); },
+  });
+  corkForTurn(stream);
+  assert.equal(stream.write(Buffer.from("abc")), true);
+  corkForTurn(stream);
+  assert.equal(stream.write(Buffer.from("def")), false);
+  const drained = once(stream, "drain");
+  assert.equal(batches.length, 0);
+  await drained;
+  assert.equal(batches.length, 1);
+  assert.equal(Buffer.concat(batches[0]).toString(), "abcdef");
+  assert.equal(stream.writableCorked, 0);
+  stream.end();
+});
+
+test("corkForTurn does not release a caller's cork or lose data on end", async () => {
+  const { Writable } = require("node:stream");
+  const { once } = require("node:events");
+  const { corkForTurn } = require("../tcp_utils");
+  const chunks = [];
+  const stream = new Writable({
+    write(chunk, encoding, callback) { chunks.push(chunk); callback(); },
+  });
+  stream.cork();
+  corkForTurn(stream);
+  stream.write("first");
+  await new Promise((resolve) => process.nextTick(resolve));
+  assert.equal(stream.writableCorked, 1);
+  assert.equal(chunks.length, 0);
+  stream.uncork();
+  corkForTurn(stream);
+  const finished = once(stream, "finish");
+  stream.end("last");
+  await finished;
+  assert.equal(Buffer.concat(chunks).toString(), "firstlast");
+});

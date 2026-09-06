@@ -1,5 +1,11 @@
 "use strict";
 
+function corkForTurn(stream) {
+  if (!stream || stream.writableCorked > 0 || !stream.writable) return;
+  stream.cork();
+  process.nextTick(() => stream.uncork());
+}
+
 function getReverseFlow(srcIP, dstIP, srcPort, dstPort) {
   return {
     relaySrcIP: dstIP,
@@ -81,6 +87,7 @@ function parseTCPOptions(packet, start, end) {
 }
 
 module.exports = {
+  corkForTurn,
   getReverseFlow,
   parseTCPOptions,
   takeQueuedBytes,

@@ -164,6 +164,11 @@ function parseArgs(args) {
         throw new TypeError("--relay-runtime must not be empty");
       }
       options.relayRuntime = relayRuntime;
+    } else if (arg.startsWith("--relay-cpu-prof-dir=")) {
+      options.relayCpuProfDir = arg.slice("--relay-cpu-prof-dir=".length);
+      if (!options.relayCpuProfDir) {
+        throw new TypeError("--relay-cpu-prof-dir must not be empty");
+      }
     } else {
       throw new TypeError(`Unknown option: ${arg}`);
     }
@@ -459,6 +464,14 @@ class FakeVM {
   scheduleAck(ackNumber, receivedAt, duplicate) {
     const dueAt = receivedAt + this.ackDelayMs;
     const delayMs = Math.max(0, dueAt - performance.now());
+    // setTimeout(0) still waits for a timer turn. Ceiling workloads explicitly
+    // request immediate ACKs; imposing a timer here measures the fake VM.
+    if (delayMs === 0) {
+      if (!duplicate && this.lastAckSent !== null &&
+          (ackNumber === this.lastAckSent || seqBefore(ackNumber, this.lastAckSent))) return;
+      this.sendAck(ackNumber);
+      return;
+    }
     const timer = setTimeout(() => {
       this.ackTimers.delete(timer);
       if (!duplicate && this.lastAckSent !== null) {
@@ -552,7 +565,16 @@ async function startRelay(tcpWindowSize, options) {
   const nodePath = inheritedNodePath
     ? `${NODE_MODULES}${path.delimiter}${inheritedNodePath}`
     : NODE_MODULES;
-  const child = spawn(relayRuntime, [path.join(relayRoot, "relay.js")], {
+  const runtimeArgs = [];
+  if (options.relayCpuProfDir) {
+    runtimeArgs.push(
+      "--cpu-prof",
+      `--cpu-prof-dir=${path.resolve(options.relayCpuProfDir)}`,
+      "--require", path.join(__dirname, "profile-exit.js"),
+    );
+  }
+  runtimeArgs.push(path.join(relayRoot, "relay.js"));
+  const child = spawn(relayRuntime, runtimeArgs, {
     cwd: relayRoot,
     env: {
       ...process.env,
@@ -727,6 +749,7 @@ async function runBenchmark(options) {
     node: process.version,
     relayRoot: options.relayRoot || ROOT,
     relayRuntime: options.relayRuntime || process.execPath,
+    relayCpuProfDir: options.relayCpuProfDir,
     durationMs: options.durationMs,
     ackDelayMs: options.ackDelayMs,
     ackEvery: options.ackEvery,
@@ -810,6 +833,7 @@ Options:
   --source-bytes=N      Source payload cap (default: 33554432)
   --windows=LIST        TCP window sizes to compare (default: 10240,65535)
   --relay-root=PATH     Directory containing the relay.js under test
+  --relay-cpu-prof-dir=DIR  Save a Node CPU profile of the relay child
   --relay-runtime=PATH  Runtime used to launch relay.js (default: current Node)
   --json                Emit machine-readable JSON
   --help                Show this help`);
@@ -834,6 +858,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  FakeVM,
   buildTCPFrame,
   delay,
   freeTcpPort,

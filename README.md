@@ -111,6 +111,9 @@ The project includes a simple web-based admin UI. By default, it's available at 
 
 ## IP-stack choke test
 
+The [performance investigation](benchmarks/PERFORMANCE.md) records the correctness
+fixes, baseline revisions (including `main`), CPU hotspots, and measured results.
+
 Run the single-process packet construction and checksum benchmark with:
 
 ```bash
@@ -213,6 +216,27 @@ before treating the result as a throughput ceiling.
 Adaptive pacing starts conservatively, grows its burst after clean ACK progress,
 and halves it on detected loss. Fixed mode is useful for controlled experiments;
 off mode removes pacing timers while retaining a cooperative event-loop yield.
+
+For CPU profiling, add `--relay-cpu-prof-dir` to either TCP benchmark. This profiles
+only the relay child using Node's CPU profiler and flushes the profile when the
+benchmark stops it. Create the output directory first:
+
+```bash
+mkdir -p performance-results/profiles
+npm run bench:tcp-egress -- --duration-ms=10000 --windows=65535 \
+  --ack-delay-ms=0 --ack-every=1 --rx-queue-packets=0 --rx-service-ms=0 \
+  --pacing-mode=off --send-burst-segments=64 --send-burst-max-segments=64 \
+  --send-burst-interval-ms=0 --source-bytes=8589934592 \
+  --relay-cpu-prof-dir=performance-results/profiles
+npm run bench:tcp-ingress -- --duration-ms=10000 \
+  --relay-cpu-prof-dir=performance-results/profiles
+```
+
+Open the resulting `.cpuprofile` files in a CPU-profile viewer such as Chrome
+DevTools. Use separate runs without profiling for throughput comparisons.
+`--ack-delay-ms=0` sends fake-VM ACKs immediately; it does not schedule zero-delay
+timers. For a sink that pauses and then recovers, ingress also accepts
+`--sink-pause-ms=500 --sink-pause-count=3`; omitting the count keeps pausing.
 
 ### Experimental jumbo VM link
 

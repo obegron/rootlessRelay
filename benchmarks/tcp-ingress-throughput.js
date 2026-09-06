@@ -46,6 +46,7 @@ function parseArgs(args) {
     relayAckEvery: 2,
     relayAckDelayMs: 10,
     sinkPauseMs: 0,
+    sinkPauseCount: Infinity,
     relayRoot: undefined,
     relayRuntime: process.execPath,
     json: false,
@@ -87,6 +88,8 @@ function parseArgs(args) {
         "--sink-pause-ms",
         { minimum: 0 },
       );
+    } else if (arg.startsWith("--sink-pause-count=")) {
+      options.sinkPauseCount = parseInteger(arg.split("=")[1], "--sink-pause-count");
     } else if (arg.startsWith("--relay-root=")) {
       options.relayRoot = arg.slice("--relay-root=".length);
       if (!options.relayRoot) throw new TypeError("--relay-root must not be empty");
@@ -94,6 +97,11 @@ function parseArgs(args) {
       options.relayRuntime = arg.slice("--relay-runtime=".length);
       if (!options.relayRuntime) {
         throw new TypeError("--relay-runtime must not be empty");
+      }
+    } else if (arg.startsWith("--relay-cpu-prof-dir=")) {
+      options.relayCpuProfDir = arg.slice("--relay-cpu-prof-dir=".length);
+      if (!options.relayCpuProfDir) {
+        throw new TypeError("--relay-cpu-prof-dir must not be empty");
       }
     } else {
       throw new TypeError(`Unknown option: ${arg}`);
@@ -242,12 +250,15 @@ async function runBenchmark(options) {
   let invalidBytes = 0;
   let deliveredBytes = 0;
   let pauseTimer = null;
+  let pauses = 0;
   const sink = net.createServer((socket) => {
     sinkSocket = socket;
     socket.on("data", (data) => {
       deliveredBytes += data.length;
       if (!hasExpectedPayload(data)) invalidBytes += data.length;
-      if (options.sinkPauseMs > 0 && pauseTimer === null) {
+      if (options.sinkPauseMs > 0 && pauseTimer === null &&
+          pauses < (options.sinkPauseCount ?? Infinity)) {
+        pauses++;
         socket.pause();
         pauseTimer = setTimeout(() => {
           pauseTimer = null;
@@ -270,6 +281,7 @@ async function runBenchmark(options) {
       relayAckDelayMs: options.relayAckDelayMs,
       relayRoot: options.relayRoot,
       relayRuntime: options.relayRuntime,
+      relayCpuProfDir: options.relayCpuProfDir,
     });
     const sender = new FakeVMSender(relay.ws, options);
     await sender.connect(remotePort);
@@ -282,11 +294,13 @@ async function runBenchmark(options) {
       node: process.version,
       relayRoot: options.relayRoot,
       relayRuntime: options.relayRuntime,
+      relayCpuProfDir: options.relayCpuProfDir,
       durationMs: options.durationMs,
       tcpMss: options.tcpMss,
       relayAckEvery: options.relayAckEvery,
       relayAckDelayMs: options.relayAckDelayMs,
       sinkPauseMs: options.sinkPauseMs,
+      sinkPauseCount: options.sinkPauseCount === Infinity ? null : options.sinkPauseCount,
       results: [{
         tcpWindowSize: options.tcpWindowSize,
         elapsedMs: timing.endedAt - timing.startedAt,
@@ -347,7 +361,9 @@ Options:
   --relay-ack-every=N      Relay cumulative ACK frequency (default: 2)
   --relay-ack-delay-ms=N   Maximum relay ACK delay (default: 10)
   --sink-pause-ms=N        Pause sink after reads to create backpressure
+  --sink-pause-count=N     Stop pausing after N reads (default: unlimited)
   --relay-root=PATH        Directory containing relay.js
+  --relay-cpu-prof-dir=DIR  Save a Node CPU profile of the relay child
   --relay-runtime=PATH     Runtime used to launch relay.js
   --json                   Emit machine-readable JSON
   --help                   Show this help`);

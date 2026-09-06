@@ -43,16 +43,14 @@ test(
     const report = await runBenchmark(options({
       durationMs: 3500,
       sinkPauseMs: 500,
+      sinkPauseCount: 3,
     }));
     const result = report.results[0];
 
     assert.ok(result.deliveredBytes > 0);
     assert.equal(result.invalidBytes, 0);
     assert.ok(result.maxOutstandingBytes <= 65535);
-    if (result.zeroWindowAcks > 0) {
-      assert.ok(result.windowReopenAcks > 0);
-    } else {
-      assert.equal(result.minAdvertisedWindow, 65535);
-    }
+    assert.ok(result.zeroWindowAcks > 0, "the paused sink must cause backpressure");
+    assert.ok(result.windowReopenAcks > 0, "the resumed sink must reopen the window");
   },
 );

@@ -43,20 +43,24 @@ function buildTCPFrame({
   ack = 0,
   flags = {},
   payload = Buffer.alloc(0),
+  window = 65535,
+  windowScale,
 }) {
-  const tcp = Buffer.alloc(20 + payload.length);
+  const headerLength = windowScale === undefined ? 20 : 24;
+  const tcp = Buffer.alloc(headerLength + payload.length);
   tcp.writeUInt16BE(srcPort, 0);
   tcp.writeUInt16BE(dstPort, 2);
   tcp.writeUInt32BE(seq >>> 0, 4);
   tcp.writeUInt32BE(ack >>> 0, 8);
-  tcp[12] = 0x50;
+  tcp[12] = (headerLength / 4) << 4;
+  if (windowScale !== undefined) Buffer.from([3, 3, windowScale, 1]).copy(tcp, 20);
   tcp[13] = (flags.fin ? 0x01 : 0) |
     (flags.syn ? 0x02 : 0) |
     (flags.rst ? 0x04 : 0) |
     (flags.psh ? 0x08 : 0) |
     (flags.ack ? 0x10 : 0);
-  tcp.writeUInt16BE(65535, 14);
-  payload.copy(tcp, 20);
+  tcp.writeUInt16BE(window, 14);
+  payload.copy(tcp, headerLength);
 
   const ip = buildIPv4Packet(tcp, srcIP, dstIP, 6, 1);
   ip.writeUInt16BE(tcpChecksum(ip), 36);
@@ -160,7 +164,7 @@ async function connectWebSocket(port, child) {
   throw lastError || new Error("Relay did not accept WebSocket");
 }
 
-async function startRelay() {
+async function startRelay(overrides = {}) {
   const wsPort = await freeTcpPort();
   const adminPort = await freeTcpPort();
   const child = spawn(process.execPath, [path.join(ROOT, "relay.js")], {
@@ -180,6 +184,7 @@ async function startRelay() {
       TCP_RTO_MAX_MS: "100",
       TCP_RTO_MAX_RETRANSMISSIONS: "2",
       REVERSE_TCP_IDLE_TIMEOUT_MS: "2000",
+      ...overrides,
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -435,3 +440,143 @@ test(
     }
   },
 );
+
+// Keep these at the wire boundary: both handlers must preserve stream bytes and
+// respond to window updates even when there is no outstanding retransmission.
+async function openTestConnection(reverse, { window = 65535, windowScale, handshakePayload } = {}) {
+  const relay = await startRelay({ TCP_RTO_INITIAL_MS: "1000", TCP_RTO_MAX_MS: "2000" });
+  const frames = new FrameQueue(relay.ws);
+  let server;
+  let socket;
+  let vmPort = 41001;
+  let remotePort;
+  const remoteIP = reverse ? GATEWAY_IP : "127.0.0.1";
+  let relaySeq;
+  const received = [];
+  try {
+    if (reverse) {
+      relay.ws.send(buildARPRequest());
+      await delay(30);
+      const hostPort = await freeTcpPort();
+      vmPort = 8080;
+      assert.equal(await postJSON(relay.adminPort, "/api/rules", {
+        type: "port", protocols: ["tcp"], host_port: hostPort,
+        bind_address: "127.0.0.1", vm: VM_IP, port: vmPort,
+      }), 201);
+      socket = await connectWithRetry(hostPort);
+      socket.on("data", (data) => received.push(data));
+      const syn = await frames.waitFor((frame) => frame.syn);
+      remotePort = syn.srcPort;
+      relaySeq = (syn.seq + 1) >>> 0;
+    } else {
+      let accept;
+      const accepted = new Promise((resolve) => { accept = resolve; });
+      server = net.createServer((peer) => {
+        socket = peer;
+        socket.on("data", (data) => received.push(data));
+        accept();
+      });
+      remotePort = await listen(server);
+      relay.ws.send(buildTCPFrame({
+        srcIP: VM_IP, dstIP: remoteIP, srcPort: vmPort, dstPort: remotePort,
+        seq: 1000, flags: { syn: true }, window, windowScale,
+      }));
+      const synAck = await frames.waitFor((frame) => frame.syn);
+      relaySeq = (synAck.seq + 1) >>> 0;
+      await accepted;
+    }
+    const send = (overrides = {}) => relay.ws.send(buildTCPFrame({
+      srcIP: VM_IP, dstIP: remoteIP, srcPort: vmPort, dstPort: remotePort,
+      seq: 1001, ack: relaySeq, flags: { ack: true }, window,
+      ...overrides,
+    }));
+    send({ seq: reverse ? 1000 : 1001,
+      flags: { syn: reverse, ack: true }, payload: handshakePayload, windowScale });
+    await frames.waitFor((frame) => frame.ackFlag && !frame.syn);
+    return {
+      frames, socket, send, received, relaySeq,
+      async close() {
+        socket.destroy();
+        await relay.close();
+        if (server) await new Promise((resolve) => server.close(resolve));
+      },
+    };
+  } catch (error) {
+    socket?.destroy();
+    await relay.close();
+    if (server) await new Promise((resolve) => server.close(resolve));
+    throw error;
+  }
+}
+
+for (const reverse of [false, true]) {
+  const direction = reverse ? "reverse" : "outbound";
+  test(`${direction} TCP preserves six-byte zero and space payloads`,
+    { skip: process.env.RUN_NETWORK_TESTS !== "1", timeout: 10000 }, async () => {
+      const conn = await openTestConnection(reverse);
+      try {
+        const zeros = Buffer.alloc(6);
+        const spaces = Buffer.alloc(6, 0x20);
+        conn.send({ payload: zeros });
+        await conn.frames.waitFor((frame) => frame.ack === 1007);
+        conn.send({ seq: 1007, payload: spaces });
+        await conn.frames.waitFor((frame) => frame.ack === 1013);
+        await delay(20);
+        assert.deepEqual(Buffer.concat(conn.received), Buffer.concat([zeros, spaces]));
+      } finally { await conn.close(); }
+    });
+
+  test(`${direction} TCP ignores unnegotiated window scaling`,
+    { skip: process.env.RUN_NETWORK_TESTS !== "1", timeout: 10000 }, async () => {
+      const conn = await openTestConnection(reverse, { window: 2, windowScale: 7 });
+      try {
+        conn.socket.write(Buffer.from("abcdefgh"));
+        const data = await conn.frames.waitFor((frame) => frame.payload.length > 0);
+        assert.equal(data.payload.toString(), "ab");
+        await conn.frames.expectNone((frame) => frame.payload.length > 0, 50);
+      } finally { await conn.close(); }
+    });
+
+  test(`${direction} TCP does not count data-bearing ACKs as duplicate ACKs`,
+    { skip: process.env.RUN_NETWORK_TESTS !== "1", timeout: 10000 }, async () => {
+      const conn = await openTestConnection(reverse);
+      try {
+        conn.socket.write(Buffer.from("unacknowledged"));
+        const data = await conn.frames.waitFor((frame) => frame.payload.length > 0);
+        for (let i = 0; i < 3; i++) {
+          conn.send({ seq: 1001 + i, payload: Buffer.from([i + 1]) });
+        }
+        await conn.frames.waitFor((frame) => frame.ack === 1004);
+        await conn.frames.expectNone((frame) => frame.payload.length > 0, 100);
+        conn.send({ seq: 1004, ack: (data.seq + data.payload.length) >>> 0 });
+        assert.deepEqual(Buffer.concat(conn.received), Buffer.from([1, 2, 3]));
+      } finally { await conn.close(); }
+    });
+
+  test(`${direction} TCP resumes on a window-only ACK`,
+    { skip: process.env.RUN_NETWORK_TESTS !== "1", timeout: 10000 }, async () => {
+      const conn = await openTestConnection(reverse, { window: 0 });
+      try {
+        const payload = Buffer.from("resume queued data");
+        conn.socket.write(payload);
+        await conn.frames.expectNone((frame) => frame.payload.length > 0, 50);
+        // An ACK for unsent bytes must not reopen the window.
+        conn.send({ window: 65535, ack: (conn.relaySeq + 100) >>> 0 });
+        await conn.frames.expectNone((frame) => frame.payload.length > 0, 50);
+        conn.send({ window: 65535 });
+        const data = await conn.frames.waitFor((frame) => frame.payload.equals(payload));
+        conn.send({ window: 65535, ack: (data.seq + payload.length) >>> 0 });
+      } finally { await conn.close(); }
+    });
+}
+
+test("outbound TCP delivers data on the final handshake ACK without retransmission",
+  { skip: process.env.RUN_NETWORK_TESTS !== "1", timeout: 10000 }, async () => {
+    const payload = Buffer.from("request on handshake");
+    const conn = await openTestConnection(false, { handshakePayload: payload });
+    try {
+      await conn.frames.waitFor((frame) => frame.ack === 1001 + payload.length);
+      await delay(20);
+      assert.deepEqual(Buffer.concat(conn.received), payload);
+    } finally { await conn.close(); }
+  });
