@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 const WebSocket = require("ws");
 const dgram = require("dgram");
 const net = require("net");
@@ -2750,7 +2751,7 @@ async function startUdpForward(rule) {
 
 const adminServer = http.createServer((req, res) => {
   if (req.url === "/") {
-    fs.readFile("admin.html", (err, data) => {
+    fs.readFile(path.join(__dirname, "admin.html"), (err, data) => {
       if (err) {
         res.writeHead(500);
         res.end("Error loading admin.html");

@@ -65,6 +65,26 @@ These default values can be overridden by setting corresponding environment vari
 
 ### 1. Installation
 
+Run the published package directly with npm:
+
+```bash
+npx rootlessrelay
+```
+
+WSS is enabled by default and requires `key.pem` and `cert.pem` in your current
+directory (see below). To run without TLS:
+
+```bash
+ENABLE_WSS=false npx rootlessrelay
+```
+
+Alternatively, install the command globally:
+
+```bash
+npm install -g rootlessrelay
+rootlessrelay
+```
+
 This project requires Node.js. You can install the dependencies using npm:
 
 ```bash

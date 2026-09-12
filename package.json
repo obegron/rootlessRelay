@@ -1,9 +1,24 @@
 {
   "name": "rootlessrelay",
-  "version": "0.5.6",
+  "version": "0.6.0",
   "description": "A WebSocket based VPN/proxy relay for virtual machines.",
   "main": "relay.js",
+  "bin": {
+    "rootlessrelay": "relay.js"
+  },
+  "files": [
+    "relay.js",
+    "tcp_utils.js",
+    "packet_utils.js",
+    "rate_limiter.js",
+    "tcp_pacer.js",
+    "tcp_retransmission.js",
+    "udp_flow_manager.js",
+    "admin.html",
+    "CHANGELOG.md"
+  ],
   "scripts": {
+    "prepublishOnly": "npm test",
     "start": "node relay.js",
     "keygen": "openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes",
     "test": "node --test tests/*.test.js",

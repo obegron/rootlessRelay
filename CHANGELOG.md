@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-09-12
 
 ### Added
 
+- Published `rootlessrelay` command for global installs and `npx`, with all runtime modules and the admin page included in the npm package.
 - TCP retransmission timeouts with exponential backoff for handshakes, data, and connection teardown in both relay directions.
 - Configurable adaptive, fixed, and disabled TCP pacing, with ACK-driven congestion control and loss recovery.
 - Optional jumbo VM MTUs advertised through DHCP and TCP MSS negotiation.
@@ -22,6 +23,7 @@
 
 ### Fixed
 
+- Load the admin page from the installed package directory when launched from another working directory.
 - Preserve valid six-byte TCP payloads containing only spaces or zero bytes.
 - Deliver data carried on the final outbound TCP handshake ACK.
 - Resume queued TCP data on valid window-only ACKs and reject window changes from invalid ACKs.
@@ -30,5 +32,5 @@
 - Handle IPv4 header lengths, packet padding, and transport checksum boundaries consistently.
 - Make zero-delay benchmark ACKs immediate, and make backpressure tests explicitly exercise sink recovery.
 
-See the [performance investigation](benchmarks/PERFORMANCE.md) for measurements,
+See the [performance investigation](https://github.com/obegron/rootlessRelay/blob/v0.6.0/benchmarks/PERFORMANCE.md) for measurements,
 reproduction commands, and remaining correctness limitations.
