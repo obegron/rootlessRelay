@@ -15,6 +15,7 @@ class TCPRetransmissionQueue {
     initialSequence,
     onRetransmit,
     onExhausted,
+    onPersistProbe,
     initialRtoMs = 1000,
     maxRtoMs = 60000,
     maxRetransmissions = 4,
@@ -38,6 +39,8 @@ class TCPRetransmissionQueue {
     this.sndNxt = initialSequence >>> 0;
     this.onRetransmit = onRetransmit;
     this.onExhausted = onExhausted;
+    this.onPersistProbe = onPersistProbe;
+    this.persist = false;
     this.initialRtoMs = initialRtoMs;
     this.maxRtoMs = maxRtoMs;
     this.maxRetransmissions = maxRetransmissions;
@@ -88,7 +91,7 @@ class TCPRetransmissionQueue {
     this.segments.push(segment);
     this.payloadBytesInFlight += payload.length;
     this.sndNxt = (this.sndNxt + length) >>> 0;
-    if (this.segments.length === 1) this.armTimer();
+    if (this.segments.length === 1 && this.timer === null) this.armTimer();
     return true;
   }
 
@@ -97,7 +100,10 @@ class TCPRetransmissionQueue {
     const advance = sequenceDistance(ack, this.sndUna);
     const outstanding = sequenceDistance(this.sndNxt, this.sndUna);
 
-    if (advance === 0) return { status: "duplicate", ackedDataBytes: 0 };
+    if (advance === 0) {
+      if (this.persist) this.timeoutRetransmissions = 0;
+      return { status: "duplicate", ackedDataBytes: 0 };
+    }
     if (advance >= HALF_SEQUENCE_SPACE) {
       return { status: "stale", ackedDataBytes: 0 };
     }
@@ -127,9 +133,9 @@ class TCPRetransmissionQueue {
 
     this.sndUna = ack;
     this.timeoutRetransmissions = 0;
-    this.currentRtoMs = this.initialRtoMs;
+    if (!this.persist) this.currentRtoMs = this.initialRtoMs;
     this.clearTimer();
-    if (this.hasOutstanding) this.armTimer();
+    this.armTimer();
     return { status: "advanced", ackedDataBytes };
   }
 
@@ -165,7 +171,7 @@ class TCPRetransmissionQueue {
   }
 
   fastRetransmit() {
-    if (!this.hasOutstanding || this.closed || this.exhausted) return false;
+    if (this.persist || !this.hasOutstanding || this.closed || this.exhausted) return false;
     this.currentRtoMs = this.initialRtoMs;
     this.clearTimer();
     if (!this.emitRetransmission("fast")) return false;
@@ -173,8 +179,23 @@ class TCPRetransmissionQueue {
     return true;
   }
 
+  setPersist(enabled) {
+    if (this.closed || this.exhausted || this.persist === enabled) return;
+    if (enabled && typeof this.onPersistProbe !== "function") {
+      throw new TypeError("a persist probe callback is required");
+    }
+    this.persist = enabled;
+    this.clearTimer();
+    this.currentRtoMs = this.initialRtoMs;
+    this.timeoutRetransmissions = 0;
+    // Repair a rejected/lost probe immediately when the peer reopens its
+    // window, rather than making subsequent data wait for another RTO.
+    if (!enabled && this.hasOutstanding) this.emitRetransmission("window-open");
+    this.armTimer();
+  }
+
   armTimer() {
-    if (!this.hasOutstanding || this.closed || this.exhausted) return;
+    if ((!this.hasOutstanding && !this.persist) || this.closed || this.exhausted) return;
     const generation = ++this.timerGeneration;
     this.timer = this.setTimeoutFn(() => {
       if (generation !== this.timerGeneration || this.closed || this.exhausted) {
@@ -194,7 +215,33 @@ class TCPRetransmissionQueue {
   }
 
   handleTimeout() {
-    if (!this.hasOutstanding || this.closed || this.exhausted) return;
+    if (this.closed || this.exhausted) return;
+    if (this.persist) {
+      if (this.timeoutRetransmissions >= this.maxRetransmissions) {
+        this.exhausted = true;
+        this.clearTimer();
+        this.onExhausted(new Error("TCP zero-window probe limit exceeded"), this.oldest);
+        return;
+      }
+      this.timeoutRetransmissions++;
+      try {
+        if (this.onPersistProbe(this.oldest) === false) {
+          // Transport backpressure is not a missed response from the peer.
+          this.timeoutRetransmissions--;
+        }
+      } catch (error) {
+        this.exhausted = true;
+        this.clearTimer();
+        this.onExhausted(error, this.oldest);
+        return;
+      }
+      // A probe can track its first byte and arm a timer; keep exactly one.
+      this.clearTimer();
+      this.currentRtoMs = Math.min(this.currentRtoMs * 2, this.maxRtoMs);
+      this.armTimer();
+      return;
+    }
+    if (!this.hasOutstanding) return;
     if (this.timeoutRetransmissions >= this.maxRetransmissions) {
       this.exhausted = true;
       this.clearTimer();
@@ -224,6 +271,7 @@ class TCPRetransmissionQueue {
   close() {
     if (this.closed) return;
     this.closed = true;
+    this.persist = false;
     this.clearTimer();
     this.segments.length = 0;
     this.payloadBytesInFlight = 0;

@@ -15,6 +15,55 @@ function getReverseFlow(srcIP, dstIP, srcPort, dstPort) {
   };
 }
 
+// Keep disjoint ranges, retaining the first copy of each byte. Sequence offsets
+// are relative to RCV.NXT so sorting also works across the 32-bit wrap boundary.
+function bufferTCPOutOfOrder(conn, sequence, payload, capacity) {
+  const start = (sequence - conn.vmSeq) >>> 0;
+  if (start === 0 || start >= capacity) return;
+  const end = Math.min(start + payload.length, capacity);
+  let cursor = start;
+  const ranges = [...conn.vmOutOfOrder].sort((a, b) =>
+    ((a[0] - conn.vmSeq) >>> 0) - ((b[0] - conn.vmSeq) >>> 0)
+  );
+  const add = (from, to) => {
+    if (to <= from) return;
+    // Copy only retained bytes; a small range must not pin a large WS buffer.
+    const chunk = Buffer.from(payload.subarray(from - start, to - start));
+    conn.vmOutOfOrder.set((conn.vmSeq + from) >>> 0, chunk);
+    conn.vmOutOfOrderBytes += chunk.length;
+  };
+  for (const [seq, buffered] of ranges) {
+    const offset = (seq - conn.vmSeq) >>> 0;
+    if (offset >= end) break;
+    if (offset + buffered.length <= cursor) continue;
+    add(cursor, Math.min(offset, end));
+    cursor = Math.max(cursor, offset + buffered.length);
+    if (cursor >= end) return;
+  }
+  add(cursor, end);
+}
+
+function drainTCPOutOfOrder(conn, write) {
+  if (conn.vmOutOfOrder.size === 0) return 0;
+  const expected = conn.vmSeq;
+  const ranges = [...conn.vmOutOfOrder].sort((a, b) =>
+    ((a[0] - expected) | 0) - ((b[0] - expected) | 0)
+  );
+  let delivered = 0;
+  for (const [seq, buffered] of ranges) {
+    if (((seq - conn.vmSeq) | 0) > 0) break;
+    conn.vmOutOfOrder.delete(seq);
+    conn.vmOutOfOrderBytes -= buffered.length;
+    const consumed = (conn.vmSeq - seq) >>> 0;
+    if (consumed >= buffered.length) continue;
+    const tail = buffered.subarray(consumed);
+    write(tail);
+    conn.vmSeq = (conn.vmSeq + tail.length) >>> 0;
+    delivered++;
+  }
+  return delivered;
+}
+
 function takeQueuedBytes(queue, length) {
   if (!Array.isArray(queue)) throw new TypeError("queue must be an array");
   if (!Number.isSafeInteger(length) || length <= 0) {
@@ -77,7 +126,7 @@ function parseTCPOptions(packet, start, end) {
 
     if (kind === 2 && length === 4) {
       const mss = packet.readUInt16BE(offset + 2);
-      if (mss >= 536) options.mss = mss;
+      if (mss > 0) options.mss = mss;
     } else if (kind === 3 && length === 3) {
       options.windowScale = packet[offset + 2];
     }
@@ -87,7 +136,9 @@ function parseTCPOptions(packet, start, end) {
 }
 
 module.exports = {
+  bufferTCPOutOfOrder,
   corkForTurn,
+  drainTCPOutOfOrder,
   getReverseFlow,
   parseTCPOptions,
   takeQueuedBytes,

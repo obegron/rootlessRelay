@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Deduplicate overlapping out-of-order TCP receive ranges and deliver their
+  remaining tails, including across sequence-number wraparound.
+- Recover lost zero-window reopening updates with backed-off probes in both TCP
+  directions, preserving byte accounting and cleaning up probe timers on close.
+- Honor small nonzero peer MSS values and use the 536-byte IPv4 default when no
+  MSS is advertised, as specified by RFC 9293 section 3.7.1.
+
+### Changed
+
+- Forward small outbound TCP writes without waiting for earlier ACKs, matching
+  reverse TCP behavior and avoiding delayed-ACK stalls for interactive traffic.
+  Pacing, congestion control, and flow control remain in effect.
+
 ## 0.6.0 — 2026-09-12
 
 ### Added

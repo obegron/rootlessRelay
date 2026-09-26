@@ -2,7 +2,9 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { parseTCPOptions, takeQueuedBytes } = require("../tcp_utils");
+const {
+  bufferTCPOutOfOrder, drainTCPOutOfOrder, parseTCPOptions, takeQueuedBytes,
+} = require("../tcp_utils");
 
 test("takeQueuedBytes coalesces adjacent buffers into one segment", () => {
   const queue = [
@@ -52,13 +54,44 @@ test("parseTCPOptions reads MSS and window scaling", () => {
   });
 });
 
-test("parseTCPOptions ignores undersized MSS and malformed tails", () => {
+test("parseTCPOptions accepts small MSS and ignores malformed tails and zero MSS", () => {
   const packet = Buffer.from([2, 4, 0, 100, 3, 4, 7]);
-  assert.deepEqual(parseTCPOptions(packet, 0, packet.length), {});
+  assert.deepEqual(parseTCPOptions(packet, 0, packet.length), { mss: 100 });
+  assert.deepEqual(parseTCPOptions(Buffer.from([2, 4, 0, 0]), 0, 4), {});
   assert.throws(
     () => parseTCPOptions(packet, 0, packet.length + 1),
     /invalid TCP option bounds/,
   );
+});
+
+for (const initial of [1000, 0xfffffffc]) {
+  test(`TCP reassembly deduplicates and drains overlapping tails at sequence ${initial}`, () => {
+    const conn = { vmSeq: initial, vmOutOfOrder: new Map(), vmOutOfOrderBytes: 0 };
+    const at = (offset) => (initial + offset) >>> 0;
+    bufferTCPOutOfOrder(conn, at(4), Buffer.from("efgh"), 32);
+    bufferTCPOutOfOrder(conn, at(4), Buffer.from("efghijkl"), 32);
+    bufferTCPOutOfOrder(conn, at(6), Buffer.from("ghijklmn"), 32);
+    assert.equal(conn.vmOutOfOrderBytes, 10, "duplicates do not consume window space");
+    conn.vmSeq = at(6); // A differently segmented packet filled the initial gap.
+    const received = [Buffer.from("abcdef")];
+    drainTCPOutOfOrder(conn, (tail) => received.push(tail));
+    assert.equal(Buffer.concat(received).toString(), "abcdefghijklmn");
+    assert.equal(conn.vmSeq, at(14));
+    assert.equal(conn.vmOutOfOrder.size, 0);
+    assert.equal(conn.vmOutOfOrderBytes, 0);
+  });
+}
+
+test("TCP reassembly clips to the receive window and frees fully covered ranges", () => {
+  const conn = { vmSeq: 100, vmOutOfOrder: new Map(), vmOutOfOrderBytes: 0 };
+  bufferTCPOutOfOrder(conn, 109, Buffer.alloc(20), 10);
+  bufferTCPOutOfOrder(conn, 110, Buffer.alloc(1), 10);
+  bufferTCPOutOfOrder(conn, 99, Buffer.alloc(2), 10);
+  assert.equal(conn.vmOutOfOrderBytes, 1);
+  conn.vmSeq = 111;
+  assert.equal(drainTCPOutOfOrder(conn, () => assert.fail("already delivered")), 0);
+  assert.equal(conn.vmOutOfOrderBytes, 0);
+  assert.equal(conn.vmOutOfOrder.size, 0);
 });
 
 test("corkForTurn batches ordered writes and preserves backpressure", async () => {

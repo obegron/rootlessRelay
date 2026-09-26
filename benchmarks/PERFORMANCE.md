@@ -151,14 +151,16 @@ must drain within an arbitrary measurement interval.
 
 ## Remaining correctness work
 
-Code review identified areas needing dedicated follow-up tests and fixes:
+The September 26 follow-up fixes overlapping/resegmented receive tails,
+zero-window recovery, and missing/small MSS handling. It also removes the
+outbound short-write ACK dependency to favor interactive latency. These changes
+have unit and wire-level regression coverage in both relay directions; the
+throughput figures above describe the September 6 implementation, not these
+later changes. MSS handling follows
+[RFC 9293 section 3.7.1](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.7.1).
 
-- Out-of-order receive buffers drain only exact sequence keys; overlapping or
-  resegmented ranges can leave buffered tails stranded.
-- There is no zero-window persist mechanism when no data is outstanding; losing
-  a later window-reopen update can still stall a connection.
-- Receive-sequence/RST validation and MSS fallback/very-small MSS handling remain
-  incomplete. Incoming checksums are not comprehensively validated.
+Receive-sequence/RST validation remains incomplete. Incoming checksums are not
+comprehensively validated.
 
 WSS, actual browser VMs, multiple competing sessions, and higher-latency real
 networks were not benchmarked in this pass. The remaining profile hotspots are

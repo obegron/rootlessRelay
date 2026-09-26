@@ -16,6 +16,8 @@ A WebSocket based VPN/proxy relay for virtual machines.
 - **Rate Limiting:** Configurable bandwidth limits for each connected VM.
 - **TCP Loss Recovery:** Fast retransmit plus backed-off retransmission timeouts
   for handshakes, data, and connection teardown in both relay directions.
+- **TCP Flow Recovery:** Overlapping receive ranges are deduplicated, and
+  zero-window probes recover lost window-reopen updates in both directions.
 
 ## Configuration
 
@@ -236,6 +238,18 @@ before treating the result as a throughput ceiling.
 Adaptive pacing starts conservatively, grows its burst after clean ACK progress,
 and halves it on detected loss. Fixed mode is useful for controlled experiments;
 off mode removes pacing timers while retaining a cooperative event-loop yield.
+
+Small TCP writes are forwarded as soon as pacing, flow control, and rate limits
+allow, without waiting for an earlier write's ACK. This favors interactive
+latency and can produce more short packets. If a peer omits its MSS option, the
+relay uses the IPv4 default of 536 bytes; smaller nonzero advertised MSS values
+are also honored.
+
+When a VM closes its receive window, the relay probes with exponential backoff
+using the configured TCP RTO intervals. Valid probe ACKs keep a responsive peer
+alive; consecutive unanswered probes use `TCP_RTO_MAX_RETRANSMISSIONS` as their
+limit. Existing reverse-connection idle timeouts still apply. Window reopening
+repairs unacknowledged probe data immediately without waiting for another RTO.
 
 For CPU profiling, add `--relay-cpu-prof-dir` to either TCP benchmark. This profiles
 only the relay child using Node's CPU profiler and flushes the profile when the

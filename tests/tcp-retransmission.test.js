@@ -79,6 +79,99 @@ test("RTO retransmits a lost final segment with the original sequence", () => {
   assert.equal(queue.sndNxt, 105);
 });
 
+test("zero-window probes back off with one timer and survive responsive closed windows", () => {
+  const probes = [];
+  const { queue, timers, failures } = makeQueue({
+    onPersistProbe: (segment) => {
+      probes.push(timers.now);
+      if (!segment) queue.track({ seq: 100, payload: Buffer.from("a") });
+    },
+    initialRtoMs: 100,
+    maxRtoMs: 400,
+    maxRetransmissions: 2,
+  });
+  queue.setPersist(true);
+  timers.advance(99);
+  assert.equal(probes.length, 0);
+  timers.advance(1);
+  assert.equal(queue.sndNxt, 101);
+  assert.equal(queue.payloadBytesInFlight, 1);
+  assert.equal(timers.timers.size, 1);
+  queue.acknowledge(100);
+  for (const interval of [200, 400, 400, 400]) {
+    timers.advance(interval);
+    queue.acknowledge(100);
+    assert.equal(timers.timers.size, 1);
+  }
+  assert.deepEqual(probes, [100, 300, 700, 1100, 1500]);
+  assert.equal(failures.length, 0);
+  assert.equal(queue.fastRetransmit(), false);
+  queue.close();
+  timers.advance(5000);
+  assert.equal(probes.length, 5);
+  assert.equal(timers.timers.size, 0);
+});
+
+test("reopening a window immediately repairs its rejected probe then restores normal RTO", () => {
+  const { queue, timers, retransmissions } = makeQueue({ onPersistProbe() {} });
+  queue.track({ seq: 100, payload: Buffer.from("x") });
+  queue.setPersist(true);
+  timers.advance(1000);
+  queue.setPersist(false);
+  assert.equal(retransmissions.length, 1);
+  assert.equal(retransmissions[0].reason, "window-open");
+  assert.equal(queue.sndNxt, 101);
+  assert.equal(timers.timers.size, 1);
+  timers.advance(1000);
+  assert.equal(retransmissions[1].reason, "timeout");
+  queue.acknowledge(101);
+  assert.equal(timers.timers.size, 0);
+});
+
+test("unanswered zero-window probes exhaust but stale or future ACKs cannot keep them alive", () => {
+  const { queue, timers, failures } = makeQueue({
+    onPersistProbe() {}, initialRtoMs: 100, maxRtoMs: 100, maxRetransmissions: 2,
+  });
+  queue.setPersist(true);
+  timers.advance(100);
+  queue.acknowledge(99);
+  queue.acknowledge(101);
+  timers.advance(200);
+  assert.equal(failures.length, 1);
+  assert.match(failures[0].error.message, /probe limit/);
+  assert.equal(timers.timers.size, 0);
+});
+
+test("accepting a probe byte preserves the backed-off probe interval", () => {
+  const { queue, timers } = makeQueue({
+    onPersistProbe: () => {
+      if (!queue.hasOutstanding) queue.track({ seq: queue.sndNxt, payload: Buffer.from("x") });
+    },
+    initialRtoMs: 100, maxRtoMs: 400,
+  });
+  queue.setPersist(true);
+  timers.advance(100);
+  queue.acknowledge(101);
+  assert.equal(queue.currentRtoMs, 200);
+  assert.equal(queue.hasOutstanding, false);
+  assert.equal(timers.timers.size, 1);
+  queue.setPersist(false);
+  assert.equal(timers.timers.size, 0);
+});
+
+test("transport backpressure does not consume the unanswered probe budget", () => {
+  const { queue, timers, failures } = makeQueue({
+    onPersistProbe: () => false,
+    initialRtoMs: 100, maxRtoMs: 100, maxRetransmissions: 2,
+  });
+  queue.setPersist(true);
+  timers.advance(1000);
+  assert.equal(queue.timeoutRetransmissions, 0);
+  assert.equal(failures.length, 0);
+  assert.equal(timers.timers.size, 1);
+  queue.close();
+});
+
 test("ACK progress cancels the RTO and later time cannot retransmit", () => {
   const { queue, timers, retransmissions } = makeQueue();
   queue.track({ seq: 100, payload: Buffer.from("data"), flags: {} });

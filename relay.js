@@ -4,7 +4,9 @@ const dgram = require("dgram");
 const net = require("net");
 const crypto = require("crypto");
 const {
+  bufferTCPOutOfOrder,
   corkForTurn,
+  drainTCPOutOfOrder,
   getReverseFlow,
   parseTCPOptions,
   takeQueuedBytes,
@@ -90,7 +92,7 @@ if (!Number.isInteger(VM_MTU) || VM_MTU < 576 || VM_MTU > 65535) {
   throw new RangeError("VM_MTU must be an integer from 576 through 65535");
 }
 const TCP_MSS = VM_MTU - 40;
-const TCP_FALLBACK_MSS = 1460;
+const TCP_FALLBACK_MSS = 536;
 
 // TCP_WINDOW_SIZE: The TCP window size used for connections to and from the VM.
 // A larger size may improve performance for high-latency connections.
@@ -513,7 +515,7 @@ class VMSession {
 
   tcpMss(conn) {
     return Math.max(
-      536,
+      1,
       Math.min(TCP_MSS, conn.sendMss || TCP_FALLBACK_MSS),
     );
   }
@@ -668,7 +670,7 @@ class VMSession {
           conn.retransmission.close();
           return;
         }
-        this.onTCPCongestionLoss(conn, reason);
+        if (reason !== "window-open") this.onTCPCongestionLoss(conn, reason);
         if (log_level >= LOG_LEVEL_DEBUG) {
           console.log(
             `TCP ${reason} retransmit seq=${segment.seq} ` +
@@ -685,6 +687,30 @@ class VMSession {
           segment.flags,
           { sequence: segment.seq, advanceSequence: false },
         );
+      },
+      onPersistProbe: (segment) => {
+        if (!isCurrent() || conn.state === "CLOSED") {
+          conn.retransmission.close();
+          return;
+        }
+        if (this.ws.bufferedAmount > 32768) return false;
+        if (segment) {
+          this.sendTCP(
+            conn, segment.payload.subarray(0, 1),
+            conn.tx.srcPort, conn.tx.dstPort, conn.tx.srcIP, conn.tx.dstIP,
+            { ack: true, fin: segment.payload.length === 0 && segment.flags.fin },
+            { sequence: segment.seq, advanceSequence: false },
+          );
+        } else if (conn.sendQueueBytes > 0) {
+          const byte = takeQueuedBytes(conn.sendQueue, 1);
+          this.sendTrackedTCP(conn, byte, { ack: true });
+          this.consumeTCPQueuedData(conn, 1, conn.socket || conn.upstream);
+        } else if (conn.pendingFin) {
+          conn.pendingFin = false;
+          conn.finSent = true;
+          conn.state = "FIN_WAIT";
+          this.sendTrackedTCP(conn, Buffer.alloc(0), { fin: true, ack: true });
+        }
       },
       onExhausted,
     });
@@ -1050,6 +1076,7 @@ class VMSession {
         this.trySendReverseToVM(connKey);
       } else if (
         ackResult.status === "duplicate" &&
+        conn.vmWindow > 0 &&
         !windowChanged && !SYN && !FIN &&
         ipPacket.length === ihl + dataOffset &&
         conn.retransmission.hasOutstanding
@@ -1102,13 +1129,8 @@ class VMSession {
             `[R-TRACE] Buffering out-of-order packet: seq=${effectiveSeq} expected=${conn.vmSeq}`,
           );
         }
-        const seqKey = effectiveSeq >>> 0;
-        if (
-          !conn.vmOutOfOrder.has(seqKey) &&
-          effectivePayload.length <= this.tcpReceiveWindow(conn)
-        ) {
-          conn.vmOutOfOrder.set(seqKey, effectivePayload);
-          conn.vmOutOfOrderBytes += effectivePayload.length;
+        if (!conn.receiveBackpressured) {
+          bufferTCPOutOfOrder(conn, effectiveSeq, effectivePayload, Math.min(0xffff, TCP_WINDOW_SIZE));
         }
         this.scheduleTCPAck(conn, 0, true);
         return;
@@ -1128,14 +1150,9 @@ class VMSession {
       let acceptedSegments = 1;
 
       // Drain any contiguous out-of-order payload that is now in-order.
-      while (conn.vmOutOfOrder && conn.vmOutOfOrder.has(conn.vmSeq)) {
-        const buffered = conn.vmOutOfOrder.get(conn.vmSeq);
-        conn.vmOutOfOrder.delete(conn.vmSeq);
-        conn.vmOutOfOrderBytes -= buffered.length;
+      acceptedSegments += drainTCPOutOfOrder(conn, (buffered) => {
         this.writeTCPReceiveData(conn, conn.downstream, buffered);
-        conn.vmSeq = (conn.vmSeq + buffered.length) >>> 0;
-        acceptedSegments++;
-      }
+      });
 
       this.scheduleTCPAck(conn, acceptedSegments);
     }
@@ -1551,6 +1568,7 @@ class VMSession {
         this.onTCPCongestionAck(conn, ackResult.ackedDataBytes, ackNum);
       } else if (
         ackResult.status === "duplicate" &&
+        conn.vmWindow > 0 &&
         !windowChanged && !SYN && !FIN &&
         ipPacket.length === ihl + dataOffset &&
         conn.retransmission.hasOutstanding
@@ -1640,13 +1658,8 @@ class VMSession {
             `   ⚠ Out of order from VM (seq=${effectiveSeq}, expected=${expected})`,
           );
         }
-        const seqKey = effectiveSeq >>> 0;
-        if (
-          !conn.vmOutOfOrder.has(seqKey) &&
-          effectivePayload.length <= this.tcpReceiveWindow(conn)
-        ) {
-          conn.vmOutOfOrder.set(seqKey, effectivePayload);
-          conn.vmOutOfOrderBytes += effectivePayload.length;
+        if (!conn.receiveBackpressured) {
+          bufferTCPOutOfOrder(conn, effectiveSeq, effectivePayload, Math.min(0xffff, TCP_WINDOW_SIZE));
         }
         this.scheduleTCPAck(conn, 0, true);
         return;
@@ -1664,16 +1677,11 @@ class VMSession {
       let acceptedSegments = 1;
 
       // Drain any contiguous out-of-order payload that is now in-order.
-      while (conn.vmOutOfOrder && conn.vmOutOfOrder.has(conn.vmSeq)) {
-        const buffered = conn.vmOutOfOrder.get(conn.vmSeq);
-        conn.vmOutOfOrder.delete(conn.vmSeq);
-        conn.vmOutOfOrderBytes -= buffered.length;
-        conn.vmSeq = (conn.vmSeq + buffered.length) >>> 0;
+      acceptedSegments += drainTCPOutOfOrder(conn, (buffered) => {
         if (conn.socket && conn.socket.writable) {
           this.writeTCPReceiveData(conn, conn.socket, buffered);
         }
-        acceptedSegments++;
-      }
+      });
 
       this.scheduleTCPAck(conn, acceptedSegments);
     }
@@ -1777,10 +1785,13 @@ class VMSession {
     source,
     maybeFin,
     rateLimited = false,
-    holdPartialSegment = false,
   }) {
     conn.sending = true;
     let cooperativeSegments = 0;
+
+    conn.retransmission.setPersist(conn.vmWindow === 0 && (
+      conn.retransmission.hasOutstanding || conn.sendQueueBytes > 0 || conn.pendingFin
+    ));
 
     while (true) {
       if (!isCurrent()) {
@@ -1808,15 +1819,6 @@ class VMSession {
       const MSS = this.tcpMss(conn);
       const toSend = Math.min(MSS, conn.sendQueueBytes, available);
       if (toSend <= 0) {
-        conn.sending = false;
-        return;
-      }
-      if (
-        holdPartialSegment &&
-        toSend < MSS &&
-        inFlightBytes > 0 &&
-        !conn.pendingFin
-      ) {
         conn.sending = false;
         return;
       }
@@ -1897,7 +1899,6 @@ class VMSession {
       source: conn.socket,
       maybeFin: () => this.maybeSendTCPFin(connKey, conn),
       rateLimited: true,
-      holdPartialSegment: true,
     });
   }
 
