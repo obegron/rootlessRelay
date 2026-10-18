@@ -16,6 +16,8 @@
 - Forward small outbound TCP writes without waiting for earlier ACKs, matching
   reverse TCP behavior and avoiding delayed-ACK stalls for interactive traffic.
   Pacing, congestion control, and flow control remain in effect.
+- Use slow start below ssthresh (RFC 5681, with RFC 3465 byte counting) instead
+  of always growing the congestion window by one segment per round trip.
 
 ## 0.6.0 — 2026-09-12
 

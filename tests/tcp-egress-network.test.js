@@ -149,3 +149,35 @@ test(
     assert.equal(result.retransmittedSegments, 0);
   },
 );
+
+test(
+  "slow start fills a large window within a few round trips",
+  { skip: process.env.RUN_NETWORK_TESTS !== "1", timeout: 10000 },
+  async () => {
+    const report = await runBenchmark({
+      durationMs: 1500,
+      ackDelayMs: 100,
+      ackEvery: 2,
+      rxQueuePackets: 0,
+      rxServiceMs: 0,
+      pacingMode: "off",
+      sendBurstSegments: 64,
+      sendBurstMaxSegments: 64,
+      sendBurstIntervalMs: 0,
+      initialCwndBytes: 10240,
+      windows: [65535],
+      json: false,
+    });
+    const result = report.results[0];
+    const windowRate = 65535 / 0.1;
+
+    assert.equal(result.invalidPayloadSegments, 0);
+    assert.equal(result.droppedDataSegments, 0);
+    // Growing one segment per RTT from 10 KiB takes ~38 RTTs to reach 64 KiB.
+    assert.ok(
+      result.goodputBytesPerSecond > windowRate * 0.6,
+      `expected near window-limited goodput: ${result.goodputBytesPerSecond} ` +
+        `versus ${windowRate} bytes/s`,
+    );
+  },
+);
