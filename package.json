@@ -1,6 +1,6 @@
 {
   "name": "rootlessrelay",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "A WebSocket based VPN/proxy relay for virtual machines.",
   "main": "relay.js",
   "bin": {
