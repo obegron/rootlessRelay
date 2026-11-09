@@ -27,22 +27,22 @@ These default values can be overridden by setting corresponding environment vari
 
 | Setting                  | Purpose                                                                | Default     |
 | ------------------------ | ---------------------------------------------------------------------- | ----------- |
-| `RATE_LIMIT_KBPS`        | Maximum upload/download bandwidth for each VM in kilobytes per second. | `1024`      |
+| `RATE_LIMIT_KBPS`        | Maximum TCP download bandwidth (Internet to VM) per VM, in KiB/s. Uploads, UDP, and port forwards are not limited. | `1024`      |
 | `MAX_CONNECTIONS_PER_IP` | Maximum number of concurrent WebSocket connections from a single IP.   | `4`         |
 | `ENABLE_WSS`             | Use Secure WebSockets (WSS). Requires `cert.pem` and `key.pem`.        | `true`      |
 | `ENABLE_VM_TO_VM`        | Allow VMs on the same relay to communicate with each other.            | `true`      |
-| `LOG_LEVEL`              | Controls logging verbosity. `0` (Disabled), `1` (Debug), `2` (Trace).  | `1` (Debug) |
+| `LOG_LEVEL`              | Controls logging verbosity. `0` (Disabled), `1` (Debug), `2` (Trace). Debug logs every packet and costs significant throughput. | `0` (Disabled) |
 
 ### Network & Port Settings
 
 | Setting              | Purpose                                                    | Default                    |
 | -------------------- | ---------------------------------------------------------- | -------------------------- |
-| `GATEWAY_IP`         | IP address of the virtual gateway within the VM's network. | `10.0.2.2`                 |
+| `GATEWAY_IP`         | IP address of the virtual gateway. The VM network is the /24 containing it. | `10.0.2.2`                 |
 | `DHCP_START`         | The starting IP address for the DHCP pool (last octet).    | `15`                       |
 | `DHCP_END`           | The ending IP address for the DHCP pool (last octet).      | `254`                      |
 | `DNS_SERVER_IP`      | DNS server provided to VMs via DHCP.                       | `8.8.8.8`                  |
 | `VM_MTU`             | VM-to-relay link MTU; also controls the negotiated TCP MSS. | `1500`                    |
-| `TCP_WINDOW_SIZE`    | TCP window size for connections to/from the VM.            | `10240`                    |
+| `TCP_WINDOW_SIZE`    | TCP window size for connections to/from the VM (at most `65535`; window scaling is not negotiated). | `10240`                    |
 | `TCP_PACING_MODE`     | VM-bound pacing mode: `adaptive`, `fixed`, or `off`.       | `adaptive`                 |
 | `TCP_SEND_BURST_SEGMENTS` | Initial adaptive or exact fixed TCP burst.           | `3`                        |
 | `TCP_SEND_BURST_MAX_SEGMENTS` | Maximum burst used by adaptive pacing.           | `8`                        |
@@ -53,9 +53,11 @@ These default values can be overridden by setting corresponding environment vari
 | `TCP_ACK_DELAY_MS`    | Maximum delay before ACKing VM upload data.                 | `10`                       |
 | `UDP_FLOW_IDLE_TIMEOUT_MS` | Idle lifetime of a UDP flow mapping.                  | `30000`                    |
 | `MAX_UDP_FLOWS_PER_SESSION` | Maximum concurrent UDP flows per VM session.          | `256`                      |
-| `TCP_RTO_INITIAL_MS` | Initial TCP retransmission timeout.                            | `1000`                     |
+| `TCP_RTO_INITIAL_MS` | TCP retransmission timeout before the first RTT measurement.   | `1000`                     |
+| `TCP_RTO_MIN_MS` | Lower bound for the RTT-derived timeout (RFC 6298).                 | `200`                      |
 | `TCP_RTO_MAX_MS` | Maximum backed-off TCP retransmission timeout.                      | `60000`                    |
-| `TCP_RTO_MAX_RETRANSMISSIONS` | Retransmissions before a TCP connection is aborted.   | `4`                        |
+| `TCP_RTO_MAX_RETRANSMISSIONS` | Minimum retransmissions before a TCP connection is aborted. | `4`                  |
+| `TCP_RTO_GIVE_UP_MS` | Minimum time without progress before a TCP connection is aborted. | `30000`                  |
 | `WS_PORT`            | Port for the WebSocket server.                             | `8443` (WSS) / `8086` (WS) |
 | `WS_BIND_ADDRESS`    | IP address for the WebSocket server to bind to.            | `0.0.0.0`                  |
 | `ADMIN_PORT`         | Port for the web-based admin interface.                    | `8001`                     |

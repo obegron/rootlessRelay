@@ -58,6 +58,7 @@ function makeQueue(options = {}) {
     onExhausted: (error, segment) => failures.push({ error, segment }),
     setTimeoutFn: timers.setTimeout,
     clearTimeoutFn: timers.clearTimeout,
+    now: () => timers.now,
     ...options,
   });
   return { queue, timers, retransmissions, failures };
@@ -289,4 +290,92 @@ test("closing invalidates pending timer callbacks", () => {
 
   assert.equal(retransmissions.length, 0);
   assert.equal(failures.length, 0);
+});
+
+test("RTO adapts to measured RTT (RFC 6298)", () => {
+  const { queue, timers, retransmissions } = makeQueue({
+    initialRtoMs: 1000,
+    minRtoMs: 50,
+  });
+  queue.track({ seq: 100, payload: Buffer.from("a"), flags: {} });
+  timers.advance(40);
+  queue.acknowledge(101);
+  // First sample: SRTT=40, RTTVAR=20, RTO=40+4*20=120.
+  assert.equal(queue.srttMs, 40);
+  assert.equal(queue.rtoMs, 120);
+  assert.equal(queue.currentRtoMs, 120);
+
+  queue.track({ seq: 101, payload: Buffer.from("b"), flags: {} });
+  timers.advance(119);
+  assert.equal(retransmissions.length, 0);
+  timers.advance(1);
+  assert.equal(retransmissions.length, 1, "retransmits at the measured RTO");
+});
+
+test("RTO is clamped to the configured minimum", () => {
+  const { queue, timers } = makeQueue({ initialRtoMs: 1000, minRtoMs: 200 });
+  queue.track({ seq: 100, payload: Buffer.from("a"), flags: {} });
+  timers.advance(1);
+  queue.acknowledge(101);
+  assert.equal(queue.rtoMs, 200);
+});
+
+test("ACKs of retransmitted segments yield no RTT sample (Karn)", () => {
+  const { queue, timers } = makeQueue({ initialRtoMs: 100, minRtoMs: 10 });
+  queue.track({ seq: 100, payload: Buffer.from("a"), flags: {} });
+  timers.advance(100); // timeout retransmission
+  timers.advance(5);
+  queue.acknowledge(101);
+  assert.equal(queue.srttMs, null);
+  assert.equal(queue.rtoMs, 100);
+
+  queue.track({ seq: 101, payload: Buffer.from("b"), flags: {} });
+  queue.noteRetransmitted(queue.oldest);
+  timers.advance(5);
+  queue.acknowledge(102);
+  assert.equal(queue.srttMs, null, "externally resent segments are excluded");
+});
+
+test("time-based give-up keeps retrying until the budget is spent", () => {
+  const { queue, timers, retransmissions, failures } = makeQueue({
+    initialRtoMs: 100,
+    maxRtoMs: 1000,
+    maxRetransmissions: 2,
+    giveUpMs: 1500,
+  });
+  queue.track({ seq: 100, payload: Buffer.from("x"), flags: {} });
+
+  // Timeouts at 100, 300, 700 (count reached, 600 ms elapsed), 1500 (1400 ms).
+  timers.advance(1500);
+  assert.equal(failures.length, 0);
+  assert.equal(retransmissions.length, 4);
+  timers.advance(1000); // 2500: 2400 ms since the first timeout.
+  assert.equal(failures.length, 1);
+  assert.equal(retransmissions.length, 4);
+});
+
+test("ACKs restart the RTO without re-creating timers", () => {
+  const { queue, timers, retransmissions } = makeQueue({ initialRtoMs: 100, minRtoMs: 100, maxRtoMs: 100 });
+  let created = 0;
+  const setTimeoutFn = timers.setTimeout;
+  queue.setTimeoutFn = (callback, delay) => {
+    created++;
+    return setTimeoutFn(callback, delay);
+  };
+  for (let i = 0; i < 10; i++) {
+    queue.track({ seq: 100 + i, payload: Buffer.from("x"), flags: {} });
+  }
+  for (let i = 1; i <= 5; i++) {
+    timers.advance(30);
+    queue.acknowledge(100 + i);
+  }
+  // The first timer fired early at t=100 and re-armed once for the rest of
+  // the deadline: timer churn scales with RTOs elapsed, not ACKs received.
+  assert.equal(created, 2);
+  // Last ACK at t=150 restarts the 100 ms RTO: nothing fires before t=250.
+  timers.advance(99);
+  assert.equal(retransmissions.length, 0);
+  timers.advance(1);
+  assert.equal(retransmissions.length, 1);
+  assert.equal(retransmissions[0].seq, 105);
 });
