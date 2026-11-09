@@ -8,6 +8,7 @@
   },
   "files": [
     "relay.js",
+    "clock.js",
     "tcp_utils.js",
     "packet_utils.js",
     "rate_limiter.js",

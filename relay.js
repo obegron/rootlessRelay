@@ -11,6 +11,7 @@ const {
   parseTCPOptions,
   takeQueuedBytes,
 } = require("./tcp_utils");
+const { coarseNow } = require("./clock");
 const { SlidingWindowRateLimiter } = require("./rate_limiter");
 const { TCPPacer, VALID_MODES } = require("./tcp_pacer");
 const { TCPRetransmissionQueue } = require("./tcp_retransmission");
@@ -23,6 +24,7 @@ const {
   parseUDPDatagram,
   tcpChecksum,
   udpChecksum,
+  writeIPv4Header,
 } = require("./packet_utils");
 
 // ==============================================================================
@@ -63,19 +65,35 @@ const LOG_LEVEL_TRACE = 2;
 // LOG_LEVEL_TRACE for verbose packet-level trace logging, or
 // LOG_LEVEL_DISABLED to disable all debug/trace logging.
 // ENV: LOG_LEVEL
-const log_level = process.env.LOG_LEVEL ? parseInt(process.env.LOG_LEVEL, 10) : LOG_LEVEL_DEBUG;
+// Debug logging writes several synchronous lines per packet, which costs far
+// more than the packet processing itself, so it is opt-in.
+const log_level = process.env.LOG_LEVEL ? parseInt(process.env.LOG_LEVEL, 10) : LOG_LEVEL_DISABLED;
 
 // GATEWAY_IP: The IP address of the virtual gateway within the VM's network.
 // ENV: GATEWAY_IP
 const GATEWAY_IP = process.env.GATEWAY_IP || "10.0.2.2";
+if (!/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(GATEWAY_IP) ||
+  GATEWAY_IP.split(".").some((octet) => Number(octet) > 255)) {
+  throw new RangeError("GATEWAY_IP must be a dotted IPv4 address");
+}
+// The VM network is the /24 containing the gateway.
+const SUBNET_PREFIX = GATEWAY_IP.slice(0, GATEWAY_IP.lastIndexOf(".") + 1);
+const GATEWAY_OCTET = Number(GATEWAY_IP.slice(SUBNET_PREFIX.length));
+const BROADCAST_IP = `${SUBNET_PREFIX}255`;
 
 // DHCP_START: The starting IP address for the DHCP pool (the last octet).
 // ENV: DHCP_START
-const DHCP_START = process.env.DHCP_START ? parseInt(process.env.DHCP_START, 10) : 15; // Assigns IPs from 10.0.2.15
+const DHCP_START = process.env.DHCP_START ? parseInt(process.env.DHCP_START, 10) : 15; // Assigns IPs from <subnet>.15
 
 // DHCP_END: The ending IP address for the DHCP pool (the last octet).
 // ENV: DHCP_END
-const DHCP_END = process.env.DHCP_END ? parseInt(process.env.DHCP_END, 10) : 254; // Assigns IPs up to 10.0.2.254
+const DHCP_END = process.env.DHCP_END ? parseInt(process.env.DHCP_END, 10) : 254; // Assigns IPs up to <subnet>.254
+if (
+  !Number.isInteger(DHCP_START) || !Number.isInteger(DHCP_END) ||
+  DHCP_START < 1 || DHCP_END > 254 || DHCP_START > DHCP_END
+) {
+  throw new RangeError("DHCP_START and DHCP_END must satisfy 1 <= start <= end <= 254");
+}
 
 // DNS_SERVER_IP: The IP address of the DNS server provided to the VMs via DHCP.
 // ENV: DNS_SERVER_IP
@@ -98,6 +116,10 @@ const TCP_FALLBACK_MSS = 536;
 // A larger size may improve performance for high-latency connections.
 // ENV: TCP_WINDOW_SIZE
 const TCP_WINDOW_SIZE = process.env.TCP_WINDOW_SIZE ? parseInt(process.env.TCP_WINDOW_SIZE, 10) : 1024 * 10;
+// The relay does not negotiate window scaling, so the window field is 16 bits.
+if (!Number.isInteger(TCP_WINDOW_SIZE) || TCP_WINDOW_SIZE < 1 || TCP_WINDOW_SIZE > 0xffff) {
+  throw new RangeError("TCP_WINDOW_SIZE must be an integer from 1 through 65535");
+}
 
 // TCP_PACING_MODE: adaptive grows the burst on clean ACK progress and backs off
 // on loss; fixed always uses TCP_SEND_BURST_SEGMENTS; off only yields
@@ -228,31 +250,87 @@ const TCP_RTO_MAX_RETRANSMISSIONS = process.env.TCP_RTO_MAX_RETRANSMISSIONS
   ? parseInt(process.env.TCP_RTO_MAX_RETRANSMISSIONS, 10)
   : 4;
 
+// TCP_RTO_MIN_MS: Lower bound for the RTT-derived retransmission timeout
+// (RFC 6298). TCP_RTO_INITIAL_MS applies until the first RTT sample.
+// ENV: TCP_RTO_MIN_MS
+const TCP_RTO_MIN_MS = process.env.TCP_RTO_MIN_MS
+  ? parseInt(process.env.TCP_RTO_MIN_MS, 10)
+  : Math.min(200, TCP_RTO_INITIAL_MS);
+
+// TCP_RTO_GIVE_UP_MS: Minimum time a connection keeps retransmitting without
+// progress before it is aborted, in addition to TCP_RTO_MAX_RETRANSMISSIONS.
+// This keeps an adaptive (often short) RTO from aborting connections to a VM
+// that briefly stalls, e.g. in a throttled background browser tab.
+// ENV: TCP_RTO_GIVE_UP_MS
+const TCP_RTO_GIVE_UP_MS = process.env.TCP_RTO_GIVE_UP_MS
+  ? parseInt(process.env.TCP_RTO_GIVE_UP_MS, 10)
+  : 30000;
+
+// Fail at startup rather than on every connection attempt, where the error
+// would only surface as silently dropped SYNs.
+if (
+  !(TCP_RTO_INITIAL_MS > 0) || !(TCP_RTO_MIN_MS > 0) ||
+  !(TCP_RTO_MAX_MS >= TCP_RTO_INITIAL_MS) || !(TCP_RTO_MAX_MS >= TCP_RTO_MIN_MS)
+) {
+  throw new RangeError(
+    "TCP RTO settings must satisfy 0 < TCP_RTO_INITIAL_MS, TCP_RTO_MIN_MS <= TCP_RTO_MAX_MS",
+  );
+}
+if (!Number.isInteger(TCP_RTO_MAX_RETRANSMISSIONS) || TCP_RTO_MAX_RETRANSMISSIONS < 1) {
+  throw new RangeError("TCP_RTO_MAX_RETRANSMISSIONS must be a positive integer");
+}
+if (!Number.isInteger(TCP_RTO_GIVE_UP_MS) || TCP_RTO_GIVE_UP_MS < 0) {
+  throw new RangeError("TCP_RTO_GIVE_UP_MS must be a non-negative integer");
+}
+
 // ==============================================================================
 // END OF CONFIGURATION
 // ==============================================================================
 
 const RATE_LIMIT_BPS = RATE_LIMIT_KBPS * 1024;
 const MAX_ETHERNET_IPV4_FRAME_SIZE = 14 + 0xffff;
+const GATEWAY_MAC = Buffer.from([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+const ETHERNET_HEADER_LENGTH = 14;
+const IPV4_HEADER_LENGTH = 20;
+// Offset of the transport header in frames the relay builds.
+const TRANSPORT_OFFSET = ETHERNET_HEADER_LENGTH + IPV4_HEADER_LENGTH;
+
+// UDP port forwarding NATs each external client to a gateway port in this
+// range when delivering to the VM, so VM replies can be routed back.
+const UDP_PROXY_NAT_PORT_MIN = 40000;
+const UDP_PROXY_NAT_PORT_COUNT = 10000;
+const UDP_PROXY_NAT_MAX_ENTRIES = 4096;
 
 const connectionsPerIP = new Map();
 const activeSessions = new Map();
-const macToIP = new Map(); // Track MAC -> IP assignments
+const macToIP = new Map(); // Preferred (sticky) IP per MAC
 const ipToSession = new Map(); // Track IP -> VMSession for inter-VM routing
-const usedIPs = new Set([2]); // Gateway is always reserved
+const usedIPs = new Set([GATEWAY_OCTET]); // Gateway is always reserved
 
-function allocateIP(mac) {
-  // Check if this MAC already has an IP
-  if (macToIP.has(mac)) {
-    return macToIP.get(mac);
+// Each session owns at most one IP. A MAC keeps its previous IP when that IP
+// is free, but two live sessions with the same MAC (e.g. cloned VMs or
+// emulator defaults) get distinct IPs rather than silently sharing one.
+function allocateIP(mac, session) {
+  if (session.vmIP) return session.vmIP;
+
+  const preferred = macToIP.get(mac);
+  if (preferred) {
+    const octet = Number(preferred.slice(SUBNET_PREFIX.length));
+    if (!usedIPs.has(octet)) {
+      usedIPs.add(octet);
+      session.vmIP = preferred;
+      ipToSession.set(preferred, session);
+      return preferred;
+    }
   }
 
-  // Find next available IP
   for (let i = DHCP_START; i <= DHCP_END; i++) {
     if (!usedIPs.has(i)) {
-      const ip = `10.0.2.${i}`;
+      const ip = `${SUBNET_PREFIX}${i}`;
       usedIPs.add(i);
       macToIP.set(mac, ip);
+      session.vmIP = ip;
+      ipToSession.set(ip, session);
       console.log(`📋 Allocated ${ip} to MAC ${mac}`);
       return ip;
     }
@@ -261,15 +339,13 @@ function allocateIP(mac) {
   throw new Error("No available IPs in pool");
 }
 
-function releaseIP(mac) {
-  const ip = macToIP.get(mac);
-  if (ip) {
-    const lastOctet = parseInt(ip.split(".")[3]);
-    usedIPs.delete(lastOctet);
-    macToIP.delete(mac);
-    ipToSession.delete(ip);
-    console.log(`🔓 Released ${ip} from MAC ${mac}`);
-  }
+function releaseIP(session) {
+  const ip = session.vmIP;
+  if (!ip) return;
+  if (ipToSession.get(ip) === session) ipToSession.delete(ip);
+  usedIPs.delete(Number(ip.slice(SUBNET_PREFIX.length)));
+  session.vmIP = null;
+  console.log(`🔓 Released ${ip}`);
 }
 
 let wss;
@@ -333,7 +409,7 @@ console.log(
   `TCP delayed ACK: every ${TCP_ACK_EVERY_SEGMENTS} segments or ` +
   `${TCP_ACK_DELAY_MS} ms`,
 );
-console.log(`DHCP Pool: 10.0.2.${DHCP_START} - 10.0.2.${DHCP_END}`);
+console.log(`DHCP Pool: ${SUBNET_PREFIX}${DHCP_START} - ${SUBNET_PREFIX}${DHCP_END}`);
 console.log(`VM-to-VM routing: ${ENABLE_VM_TO_VM ? "ENABLED" : "DISABLED"}`);
 
 const PassThrough = require("stream").PassThrough;
@@ -355,12 +431,15 @@ class VMSession {
       maxFlows: MAX_UDP_FLOWS_PER_SESSION,
       onResponse: (payload, flow) => {
         const response = flow.isDNS ? this.filterDNSResponse(payload) : payload;
+        // Parse each flow's addresses once rather than for every datagram.
+        flow.remoteAddress ??= ipv4Bytes(flow.remoteIP);
+        flow.vmAddress ??= ipv4Bytes(flow.vmIP);
         this.sendUDPToVM(
           response,
           flow.remotePort,
           flow.vmPort,
-          flow.remoteIP,
-          flow.vmIP,
+          flow.remoteAddress,
+          flow.vmAddress,
         );
       },
       onError: (err, flow) => {
@@ -374,9 +453,16 @@ class VMSession {
     this.tcpConnections = new Map();
     this.reverseTcpConnections = new Map();
     this.recentlyClosed = new Set();
-    this.udpProxyNatTable = new Map();
+    this.udpProxyNatTable = new Map(); // gateway port -> client entry
+    this.udpProxyNatByClient = new Map(); // rule/client key -> gateway port
+    this.nextUdpProxyNatPort = 0;
+    this.udpProxyNatSweep = setInterval(
+      () => this.sweepUdpProxyNat(),
+      Math.min(5000, UDP_FLOW_IDLE_TIMEOUT_MS),
+    );
+    this.udpProxyNatSweep.unref?.();
 
-    this.rateLimiter = new SlidingWindowRateLimiter(RATE_LIMIT_BPS, 1000);
+    this.rateLimiter = new SlidingWindowRateLimiter(RATE_LIMIT_BPS, 1000, coarseNow);
 
     if (log_level >= LOG_LEVEL_DEBUG) {
       console.log(`New session created for ${clientIP}`);
@@ -384,33 +470,70 @@ class VMSession {
   }
 
   forwardUdpPacket(payload, vmPort, clientRinfo, ruleId) {
-    // Find an available ephemeral port for the NAT table
-    let ephemeralPort = 40000 + Math.floor(Math.random() * 10000);
-    while (this.udpProxyNatTable.has(ephemeralPort)) {
-      ephemeralPort = 40000 + Math.floor(Math.random() * 10000);
-    }
+    if (!this.vmIP) return;
+    const clientKey = `${ruleId}|${clientRinfo.address}|${clientRinfo.port}`;
+    let ephemeralPort = this.udpProxyNatByClient.get(clientKey);
+    let entry = ephemeralPort === undefined
+      ? undefined
+      : this.udpProxyNatTable.get(ephemeralPort);
 
-    this.udpProxyNatTable.set(ephemeralPort, {
-      clientRinfo,
-      ruleId,
-      lastSeen: Date.now(),
-    });
-
-    // Clean up old entries after a timeout
-    setTimeout(() => {
-      const entry = this.udpProxyNatTable.get(ephemeralPort);
-      if (entry && (Date.now() - entry.lastSeen) > 30000) { // 30 second timeout
-        this.udpProxyNatTable.delete(ephemeralPort);
+    if (entry) {
+      entry.lastSeen = Date.now();
+    } else {
+      ephemeralPort = this.allocateUdpProxyNatPort();
+      entry = {
+        clientKey,
+        clientRinfo,
+        ruleId,
+        vmPort,
+        lastSeen: Date.now(),
+      };
+      this.udpProxyNatTable.set(ephemeralPort, entry);
+      this.udpProxyNatByClient.set(clientKey, ephemeralPort);
+      if (log_level >= LOG_LEVEL_DEBUG) {
+        console.log(
+          `[UDP PROXY NAT] Creating NAT entry for ${clientRinfo.address}:${clientRinfo.port} on ephemeral port ${ephemeralPort}`,
+        );
       }
-    }, 31000);
-
-    if (log_level >= LOG_LEVEL_DEBUG) {
-      console.log(
-        `[UDP PROXY NAT] Creating NAT entry for ${clientRinfo.address}:${clientRinfo.port} on ephemeral port ${ephemeralPort}`,
-      );
     }
 
     this.sendUDPToVM(payload, ephemeralPort, vmPort, GATEWAY_IP, this.vmIP);
+  }
+
+  allocateUdpProxyNatPort() {
+    if (this.udpProxyNatTable.size >= UDP_PROXY_NAT_MAX_ENTRIES) {
+      this.sweepUdpProxyNat();
+    }
+    if (this.udpProxyNatTable.size >= UDP_PROXY_NAT_MAX_ENTRIES) {
+      // Evict the least recently created entry rather than refusing clients.
+      const [oldestPort] = this.udpProxyNatTable.keys();
+      this.removeUdpProxyNat(oldestPort);
+    }
+    // The table holds fewer entries than the port range, so this terminates.
+    for (let i = 0; i < UDP_PROXY_NAT_PORT_COUNT; i++) {
+      const port = UDP_PROXY_NAT_PORT_MIN + this.nextUdpProxyNatPort;
+      this.nextUdpProxyNatPort =
+        (this.nextUdpProxyNatPort + 1) % UDP_PROXY_NAT_PORT_COUNT;
+      if (!this.udpProxyNatTable.has(port)) return port;
+    }
+    throw new Error("UDP proxy NAT port range exhausted");
+  }
+
+  removeUdpProxyNat(port) {
+    const entry = this.udpProxyNatTable.get(port);
+    if (!entry) return;
+    this.udpProxyNatTable.delete(port);
+    if (this.udpProxyNatByClient.get(entry.clientKey) === port) {
+      this.udpProxyNatByClient.delete(entry.clientKey);
+    }
+  }
+
+  sweepUdpProxyNat(now = Date.now()) {
+    for (const [port, entry] of this.udpProxyNatTable) {
+      if (now - entry.lastSeen >= UDP_FLOW_IDLE_TIMEOUT_MS) {
+        this.removeUdpProxyNat(port);
+      }
+    }
   }
 
   sendRSTForReverse(srcPort, dstPort, srcIP, dstIP, seqNum) {
@@ -483,6 +606,7 @@ class VMSession {
     const segment = conn.retransmission.oldest;
     if (!segment) return false;
     conn.fastRetransmitAck = conn.retransmission.sndUna;
+    conn.retransmission.noteRetransmitted(segment);
     if (log_level >= LOG_LEVEL_DEBUG) {
       console.log(
         `   🩹 TCP recovery retransmit seq=${segment.seq} ` +
@@ -661,12 +785,16 @@ class VMSession {
       initialBurstSegments: TCP_SEND_BURST_SEGMENTS,
       maxBurstSegments: TCP_SEND_BURST_MAX_SEGMENTS,
       intervalMs: TCP_SEND_BURST_INTERVAL_MS,
+      now: coarseNow,
     });
     conn.retransmission = new TCPRetransmissionQueue({
       initialSequence,
       initialRtoMs: TCP_RTO_INITIAL_MS,
+      minRtoMs: TCP_RTO_MIN_MS,
       maxRtoMs: TCP_RTO_MAX_MS,
       maxRetransmissions: TCP_RTO_MAX_RETRANSMISSIONS,
+      giveUpMs: TCP_RTO_GIVE_UP_MS,
+      now: coarseNow,
       onRetransmit: (segment, reason) => {
         if (!isCurrent()) {
           conn.retransmission.close();
@@ -1160,9 +1288,11 @@ class VMSession {
     }
 
     if (FIN) {
-      console.log(
-        `[REVERSE TCP] [${this.vmIP}] FIN received, closing connection ${connKey}`,
-      );
+      if (log_level >= LOG_LEVEL_DEBUG) {
+        console.log(
+          `[REVERSE TCP] [${this.vmIP}] FIN received, closing connection ${connKey}`,
+        );
+      }
 
       const finSequence = (seqNum + payload.length) >>> 0;
       if (finSequence !== conn.vmSeq) {
@@ -1232,8 +1362,7 @@ class VMSession {
     // Assign IP based on MAC if not already assigned
     if (!this.vmIP && this.vmMAC) {
       try {
-        this.vmIP = allocateIP(this.vmMAC);
-        ipToSession.set(this.vmIP, this); // Register this session
+        allocateIP(this.vmMAC, this);
         console.log(`✅ VM IP assigned: ${this.vmIP} (MAC: ${this.vmMAC})`);
       } catch (err) {
         console.error(`❌ Failed to allocate IP: ${err.message}`);
@@ -1326,7 +1455,7 @@ class VMSession {
     }
 
     // Handle UDP broadcast
-    if (ENABLE_VM_TO_VM && dstIP === "10.0.2.255" && protocol === 17) {
+    if (ENABLE_VM_TO_VM && dstIP === BROADCAST_IP && protocol === 17) {
       if (log_level >= LOG_LEVEL_DEBUG) {
         console.log(`📢 Broadcasting UDP packet from ${srcIP}`);
       }
@@ -1343,8 +1472,8 @@ class VMSession {
 
     // Check if this is VM-to-VM traffic
     if (
-      ENABLE_VM_TO_VM && dstIP.startsWith("10.0.2.") && dstIP !== GATEWAY_IP &&
-      dstIP !== "10.0.2.255"
+      ENABLE_VM_TO_VM && dstIP.startsWith(SUBNET_PREFIX) && dstIP !== GATEWAY_IP &&
+      dstIP !== BROADCAST_IP
     ) {
       const targetSession = ipToSession.get(dstIP);
       if (targetSession) {
@@ -1415,9 +1544,31 @@ class VMSession {
       const existing = this.tcpConnections.get(connKey);
       if (existing) {
         if (existing.state === "SYN_SENT") {
-          existing.retransmission.fastRetransmit();
+          // A retransmitted SYN: resend our SYN-ACK.
+          if (((seqNum + 1) >>> 0) === existing.vmSeq) {
+            existing.retransmission.fastRetransmit();
+            return;
+          }
+          // A new SYN on the same 4-tuple before the handshake completed:
+          // the VM abandoned the first attempt. Start over.
+          this.abortTCPConnection(
+            connKey,
+            existing,
+            new Error("VM restarted TCP handshake"),
+            false,
+          );
+        } else if (existing.state === "CLOSED") {
+          // Lingering entry from a finished connection: allow port reuse
+          // immediately instead of ignoring SYNs for the linger period.
+          this.tcpConnections.delete(connKey);
+        } else {
+          // SYN on a synchronized connection (e.g. the VM rebooted and reused
+          // the port). Send a challenge ACK (RFC 5961 section 4); a VM with
+          // no such connection answers with RST, which aborts the stale one
+          // and lets its SYN retransmission open a fresh connection.
+          this.sendTCPAck(existing);
+          return;
         }
-        return;
       }
       if (log_level >= LOG_LEVEL_DEBUG) {
         console.log(`   Opening connection to ${dstIP}:${dstPort}`);
@@ -1604,9 +1755,8 @@ class VMSession {
       if (log_level >= LOG_LEVEL_DEBUG) {
         console.log(`   🤝 Connection established: ${connKey}`);
       }
-
-      // Complete the handshake, then process any data or FIN on this ACK.
-      this.sendTCPAck(conn);
+      // The VM's ACK completed the handshake; it needs no reply of its own.
+      // Any data or FIN on this ACK is processed and ACKed below.
     }
 
     if (
@@ -1944,29 +2094,34 @@ class VMSession {
       }
 
       const { fin, rst, ack, psh, syn } = segmentFlags;
-      const tcpOptions = syn
-        ? Buffer.from([2, 4, TCP_MSS >>> 8, TCP_MSS & 0xff])
-        : Buffer.alloc(0);
-      const tcpHeaderLength = 20 + tcpOptions.length;
-      const tcpLen = tcpHeaderLength + chunk.length;
-      const tcp = Buffer.alloc(tcpLen);
-
-      tcp.writeUInt16BE(srcPort, 0);
-      tcp.writeUInt16BE(dstPort, 2);
-      tcp.writeUInt32BE(sequence, 4);
-      tcp.writeUInt32BE(conn.vmSeq, 8);
-      tcp[12] = (tcpHeaderLength / 4) << 4;
-      tcp[13] = (ack ? 0x10 : 0) | (fin ? 0x01 : 0) | (rst ? 0x04 : 0) |
-        (psh ? 0x08 : 0) | (syn ? 0x02 : 0);
-      tcp.writeUInt16BE(
-        flags.windowSize ?? this.tcpReceiveWindow(conn),
-        14,
+      // Build Ethernet, IPv4, and TCP headers and the payload in one buffer:
+      // one allocation and one payload copy per segment.
+      const tcpHeaderLength = syn ? 24 : 20; // SYNs carry the MSS option.
+      const frame = this.allocIPv4Frame(
+        tcpHeaderLength + chunk.length,
+        6,
+        (conn.tx?.srcIP === srcIP && conn.tx.srcAddress) || srcIP,
+        (conn.tx?.dstIP === dstIP && conn.tx.dstAddress) || dstIP,
       );
-      tcp.writeUInt16BE(0, 16); // Checksum (placeholder)
-      tcp.writeUInt16BE(0, 18); // Urgent Pointer
-
-      tcpOptions.copy(tcp, 20);
-      if (chunk.length > 0) chunk.copy(tcp, tcpHeaderLength);
+      const t = TRANSPORT_OFFSET;
+      frame.writeUInt16BE(srcPort, t);
+      frame.writeUInt16BE(dstPort, t + 2);
+      frame.writeUInt32BE(sequence, t + 4);
+      frame.writeUInt32BE(conn.vmSeq, t + 8);
+      frame[t + 12] = (tcpHeaderLength / 4) << 4;
+      frame[t + 13] = (ack ? 0x10 : 0) | (fin ? 0x01 : 0) | (rst ? 0x04 : 0) |
+        (psh ? 0x08 : 0) | (syn ? 0x02 : 0);
+      frame.writeUInt16BE(
+        flags.windowSize ?? this.tcpReceiveWindow(conn),
+        t + 14,
+      );
+      frame.writeUInt32BE(0, t + 16); // Checksum placeholder + urgent pointer
+      if (syn) {
+        frame[t + 20] = 2; // MSS option
+        frame[t + 21] = 4;
+        frame.writeUInt16BE(TCP_MSS, t + 22);
+      }
+      if (chunk.length > 0) chunk.copy(frame, t + tcpHeaderLength);
 
       // Increment the sequence number by the size of the chunk for the next segment.
       const seqIncr = chunk.length + (fin ? 1 : 0) + (syn ? 1 : 0);
@@ -1974,7 +2129,7 @@ class VMSession {
         sentSegments.push({
           seq: sequence,
           payload: chunk,
-          flags: { ...segmentFlags },
+          flags: segmentFlags,
         });
         sequence = (sequence + seqIncr) >>> 0;
         if (options.advanceSequence !== false) {
@@ -1982,16 +2137,11 @@ class VMSession {
         }
       }
 
-      const ip = this.buildIP(
-        tcp,
-        conn.tx?.srcIP === srcIP ? conn.tx.srcAddress : srcIP,
-        conn.tx?.dstIP === dstIP ? conn.tx.dstAddress : dstIP,
-        6,
+      frame.writeUInt16BE(
+        tcpChecksum(frame.subarray(ETHERNET_HEADER_LENGTH)),
+        t + 16,
       );
-      const cksum = this.calcTCPChecksum(ip);
-      ip.writeUInt16BE(cksum, 20 + 16); // Write checksum in TCP header within IP packet
-
-      this.sendIPToVM(ip);
+      this.sendFrameToVM(frame);
 
       // If we sent a zero-length payload (e.g., a pure ACK or SYN), we've done our one and only loop.
       if (payload.length === 0) {
@@ -2055,9 +2205,15 @@ class VMSession {
       console.log(`📡 UDP: ${srcPort} -> ${dstPort}`);
     }
 
-    // Check if this is a response for a proxied UDP connection
-    if (this.udpProxyNatTable.has(dstPort)) {
-      const { clientRinfo, ruleId } = this.udpProxyNatTable.get(dstPort);
+    // Check if this is a VM reply to a port-forwarded UDP client. Only
+    // datagrams addressed to the gateway's NAT port from the forwarded VM port
+    // qualify; Internet-bound traffic must not be diverted by port alone.
+    const natEntry = dstIP === GATEWAY_IP
+      ? this.udpProxyNatTable.get(dstPort)
+      : undefined;
+    if (natEntry && natEntry.vmPort === srcPort) {
+      const { clientRinfo, ruleId } = natEntry;
+      natEntry.lastSeen = Date.now();
       const hostSocket = udpProxySockets.get(ruleId);
 
       if (hostSocket) {
@@ -2069,8 +2225,7 @@ class VMSession {
         hostSocket.send(payload, clientRinfo.port, clientRinfo.address);
       }
 
-      // We don't remove the NAT entry here to allow for multiple back-and-forth packets
-      // It will be cleaned up by its timeout
+      // The entry stays for further exchanges and expires when idle.
       return;
     }
 
@@ -2263,20 +2418,19 @@ class VMSession {
 
   sendUDPToVM(payload, srcPort, dstPort, srcIP, dstIP) {
     const udpLen = 8 + payload.length;
-    const udp = Buffer.alloc(udpLen);
+    const frame = this.allocIPv4Frame(udpLen, 17, srcIP, dstIP);
+    const u = TRANSPORT_OFFSET;
+    frame.writeUInt16BE(srcPort, u);
+    frame.writeUInt16BE(dstPort, u + 2);
+    frame.writeUInt16BE(udpLen, u + 4);
+    frame.writeUInt16BE(0, u + 6);
+    payload.copy(frame, u + 8);
+    // A computed checksum of zero is transmitted as all ones (RFC 768).
+    const cksum = udpChecksum(frame.subarray(ETHERNET_HEADER_LENGTH)) || 0xffff;
+    frame.writeUInt16BE(cksum, u + 6);
 
-    udp.writeUInt16BE(srcPort, 0);
-    udp.writeUInt16BE(dstPort, 2);
-    udp.writeUInt16BE(udpLen, 4);
-    udp.writeUInt16BE(0, 6);
-    payload.copy(udp, 8);
-
-    const ip = this.buildIP(udp, srcIP, dstIP, 17);
-    const cksum = this.calcUDPChecksum(ip);
-    ip.writeUInt16BE(cksum, 20 + 6);
-
-    this.sendIPToVM(ip);
-    if (log_level >= LOG_LEVEL_DEBUG) console.log(`  UDP response sent`);
+    this.sendFrameToVM(frame);
+    if (log_level >= LOG_LEVEL_TRACE) console.log(`  UDP response sent`);
   }
 
   handleDHCP(udp) {
@@ -2311,11 +2465,9 @@ class VMSession {
     // Get or allocate IP for this MAC
     let assignedIP;
     try {
-      assignedIP = allocateIP(clientMACStr);
-      if (!this.vmIP) {
-        this.vmIP = assignedIP;
-        ipToSession.set(this.vmIP, this);
-      }
+      // The session's IP, regardless of the client hardware address claimed
+      // in the request, so one VM cannot drain the pool.
+      assignedIP = allocateIP(clientMACStr, this);
     } catch (err) {
       console.error(`❌ ${err.message}`);
       return;
@@ -2390,23 +2542,43 @@ class VMSession {
     this.sendIPToVM(ip);
   }
 
-  sendIPToVM(ipPacket, callback) {
-    this.bytesSent += ipPacket.length;
-    const frame = Buffer.alloc(14 + ipPacket.length);
-
+  writeEthernetHeader(frame) {
     if (this.vmMACBytes) {
       this.vmMACBytes.copy(frame, 0);
     } else {
       frame.fill(0xff, 0, 6);
     }
+    GATEWAY_MAC.copy(frame, 6);
+    frame[12] = 0x08; // IPv4
+    frame[13] = 0x00;
+  }
 
-    Buffer.from([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]).copy(frame, 6);
+  // Allocate a frame with Ethernet and IPv4 headers written. The caller fills
+  // the transport header and payload at TRANSPORT_OFFSET.
+  allocIPv4Frame(transportLength, protocol, srcIP, dstIP) {
+    const frame = Buffer.allocUnsafe(TRANSPORT_OFFSET + transportLength);
+    this.writeEthernetHeader(frame);
+    writeIPv4Header(
+      frame,
+      ETHERNET_HEADER_LENGTH,
+      IPV4_HEADER_LENGTH + transportLength,
+      protocol,
+      srcIP,
+      dstIP,
+    );
+    return frame;
+  }
 
-    frame.writeUInt16BE(0x0800, 12);
-
-    ipPacket.copy(frame, 14);
-
+  sendFrameToVM(frame, callback) {
+    this.bytesSent += frame.length - ETHERNET_HEADER_LENGTH;
     this.sendToVM(frame, callback);
+  }
+
+  sendIPToVM(ipPacket, callback) {
+    const frame = Buffer.allocUnsafe(ETHERNET_HEADER_LENGTH + ipPacket.length);
+    this.writeEthernetHeader(frame);
+    ipPacket.copy(frame, ETHERNET_HEADER_LENGTH);
+    this.sendFrameToVM(frame, callback);
   }
 
   resumeTCPTransportWaiters() {
@@ -2446,11 +2618,12 @@ class VMSession {
 
   close() {
     // Release IP when session closes
-    if (this.vmMAC) {
-      releaseIP(this.vmMAC);
-    }
+    releaseIP(this);
 
     this.udpFlows.close();
+    clearInterval(this.udpProxyNatSweep);
+    this.udpProxyNatTable.clear();
+    this.udpProxyNatByClient.clear();
 
     /*
     if (this.cleanupInterval) {
@@ -2527,8 +2700,9 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
-    const currentConnections = connectionsPerIP.get(clientIP) || 0;
-    connectionsPerIP.set(clientIP, Math.max(0, currentConnections - 1));
+    const remaining = (connectionsPerIP.get(clientIP) || 1) - 1;
+    if (remaining > 0) connectionsPerIP.set(clientIP, remaining);
+    else connectionsPerIP.delete(clientIP);
     console.log(`❌ Connection closed from ${clientIP}`);
 
     session.close();
@@ -2541,7 +2715,7 @@ wss.on("connection", (ws, req) => {
 });
 
 console.log(
-  `💡 VMs will be assigned IPs from 10.0.2.${DHCP_START} to 10.0.2.${DHCP_END}`,
+  `💡 VMs will be assigned IPs from ${SUBNET_PREFIX}${DHCP_START} to ${SUBNET_PREFIX}${DHCP_END}`,
 );
 console.log(`💡 Gateway: ${GATEWAY_IP}`);
 console.log(`💡 DNS: ${DNS_SERVER_IP}`);
@@ -2752,6 +2926,138 @@ async function startUdpForward(rule) {
   });
 }
 
+const ADMIN_MAX_BODY_BYTES = 64 * 1024;
+
+function sendAdminError(res, status, message) {
+  if (res.headersSent) return;
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: message }));
+}
+
+// Read a JSON request body. Requiring the application/json content type means
+// a browser cannot send it cross-origin without a CORS preflight, which this
+// server never approves, so other web pages cannot drive the admin API.
+function readAdminJson(req, res, onBody) {
+  const contentType = (req.headers["content-type"] || "").split(";")[0].trim();
+  if (contentType.toLowerCase() !== "application/json") {
+    req.resume();
+    sendAdminError(res, 415, "Content-Type must be application/json");
+    return;
+  }
+  const chunks = [];
+  let size = 0;
+  let aborted = false;
+  req.on("data", (chunk) => {
+    if (aborted) return;
+    size += chunk.length;
+    if (size > ADMIN_MAX_BODY_BYTES) {
+      aborted = true;
+      sendAdminError(res, 413, "Request body too large");
+      req.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on("end", () => {
+    if (aborted) return;
+    let body;
+    try {
+      body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    } catch {
+      sendAdminError(res, 400, "Invalid JSON");
+      return;
+    }
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      sendAdminError(res, 400, "Expected a JSON object");
+      return;
+    }
+    try {
+      onBody(body);
+    } catch (err) {
+      console.error(`Admin API error: ${err.message}`);
+      sendAdminError(res, 500, "Internal error");
+    }
+  });
+  req.on("error", () => {});
+}
+
+function isPort(value) {
+  return Number.isInteger(value) && value >= 1 && value <= 65535;
+}
+
+function isIPv4(value) {
+  if (typeof value !== "string") return false;
+  try {
+    ipv4Bytes(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isOptionalString(value, maxLength = 1024) {
+  return value === undefined || value === null ||
+    (typeof value === "string" && value.length <= maxLength);
+}
+
+// Returns a normalized rule containing only known fields, or an error string.
+function validateRule(input) {
+  if (!isIPv4(input.vm)) return "vm must be an IPv4 address";
+  if (!isPort(input.port)) return "port must be an integer from 1 through 65535";
+
+  if (input.type === "port") {
+    const protocols = input.protocols;
+    if (
+      !Array.isArray(protocols) || protocols.length === 0 ||
+      !protocols.every((protocol) => protocol === "tcp" || protocol === "udp")
+    ) {
+      return "protocols must be a non-empty array of \"tcp\" and/or \"udp\"";
+    }
+    if (!isPort(input.host_port)) {
+      return "host_port must be an integer from 1 through 65535";
+    }
+    if (input.bind_address && !isIPv4(input.bind_address)) {
+      return "bind_address must be an IPv4 address";
+    }
+    if (proxyRules.some((rule) =>
+      rule.type === "port" && rule.host_port === input.host_port &&
+      rule.protocols.some((protocol) => protocols.includes(protocol))
+    )) {
+      return `host port ${input.host_port} is already forwarded`;
+    }
+    return {
+      type: "port",
+      vm: input.vm,
+      port: input.port,
+      protocols: [...new Set(protocols)],
+      host_port: input.host_port,
+      bind_address: input.bind_address || "",
+    };
+  }
+
+  if (input.type === "http") {
+    if (typeof input.path !== "string" || !input.path.startsWith("/")) {
+      return "path must start with /";
+    }
+    if (!isOptionalString(input.vhost, 255) || !isOptionalString(input.targetPath)) {
+      return "vhost and targetPath must be strings";
+    }
+    if (input.targetPath && !input.targetPath.startsWith("/")) {
+      return "targetPath must start with /";
+    }
+    return {
+      type: "http",
+      vm: input.vm,
+      port: input.port,
+      vhost: input.vhost || "",
+      path: input.path,
+      targetPath: input.targetPath || "",
+    };
+  }
+
+  return "type must be \"port\" or \"http\"";
+}
+
 const adminServer = http.createServer((req, res) => {
   if (req.url === "/") {
     fs.readFile(path.join(__dirname, "admin.html"), (err, data) => {
@@ -2786,24 +3092,29 @@ const adminServer = http.createServer((req, res) => {
     });
     res.end(JSON.stringify(sessions));
   } else if (
-    req.url.match(/\/api\/sessions\/(.+)\/nickname/) && req.method === "POST"
+    /^\/api\/sessions\/[^/]+\/nickname$/.test(req.url) &&
+    (req.method === "POST" || req.method === "DELETE")
   ) {
-    const sessionId = req.url.match(/\/api\/sessions\/(.+)\/nickname/)[1];
+    const sessionId = req.url.split("/")[3];
     const session = activeSessions.get(sessionId);
-    if (session) {
-      let body = "";
-      req.on("data", (chunk) => {
-        body += chunk.toString();
-      });
-      req.on("end", () => {
-        const { nickname } = JSON.parse(body);
+    if (!session) {
+      req.resume();
+      sendAdminError(res, 404, "Unknown session");
+    } else if (req.method === "DELETE") {
+      req.resume();
+      delete session.nickname;
+      res.writeHead(204);
+      res.end();
+    } else {
+      readAdminJson(req, res, ({ nickname }) => {
+        if (typeof nickname !== "string" || nickname.length > 64) {
+          sendAdminError(res, 400, "nickname must be a string of at most 64 characters");
+          return;
+        }
         session.nickname = nickname;
         res.writeHead(200);
         res.end();
       });
-    } else {
-      res.writeHead(404);
-      res.end();
     }
   } else if (req.url === "/api/rules" && req.method === "GET") {
     res.writeHead(200, {
@@ -2811,19 +3122,19 @@ const adminServer = http.createServer((req, res) => {
     });
     res.end(JSON.stringify(proxyRules));
   } else if (req.url === "/api/rules" && req.method === "POST") {
-    let body = "";
-    req.on("data", (chunk) => {
-      body += chunk.toString();
-    });
-    req.on("end", () => {
-      const rule = JSON.parse(body);
+    readAdminJson(req, res, (input) => {
+      const rule = validateRule(input);
+      if (typeof rule === "string") {
+        sendAdminError(res, 400, rule);
+        return;
+      }
       rule.id = nextRuleId++;
       proxyRules.push(rule);
       if (rule.type === "port") {
         startPortForward(rule);
       }
-      res.writeHead(201);
-      res.end();
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(rule));
     });
   } else if (req.url.startsWith("/api/rules/") && req.method === "DELETE") {
     const id = parseInt(req.url.split("/")[3]);
@@ -2853,6 +3164,18 @@ const adminServer = http.createServer((req, res) => {
 adminServer.listen(ADMIN_PORT, ADMIN_BIND_ADDRESS, () => {
   console.log(`💡 Admin UI listening on http://${ADMIN_BIND_ADDRESS}:${ADMIN_PORT}`);
 });
+
+// Append the unmatched request remainder to a rule's target path. Unlike
+// path.join this preserves the query string and does not normalize the
+// client's path (e.g. "..", "//", or a trailing slash).
+function joinTargetPath(targetPath, remainder) {
+  if (!remainder) return targetPath || "/";
+  const base = targetPath.endsWith("/") ? targetPath.slice(0, -1) : targetPath;
+  if (remainder.startsWith("/") || remainder.startsWith("?")) {
+    return base + remainder;
+  }
+  return `${base}/${remainder}`;
+}
 
 function findProxyRule(req) {
   const host = req.headers.host;
@@ -2913,7 +3236,7 @@ async function proxyRequest(req, res, rule) {
     let url = req.url;
     if (rule.targetPath) {
       const remainingPath = req.url.substring(rule.path.length);
-      url = path.join(rule.targetPath, remainingPath);
+      url = joinTargetPath(rule.targetPath, remainingPath);
     }
 
     const headers = [`${req.method} ${url} HTTP/1.1`];
@@ -3070,7 +3393,7 @@ proxyServer.on("upgrade", async (req, socket, head) => {
     let url = req.url;
     if (rule.targetPath) {
       const remainingPath = req.url.substring(rule.path.length);
-      url = path.join(rule.targetPath, remainingPath);
+      url = joinTargetPath(rule.targetPath, remainingPath);
     }
 
     const headers = [`${req.method} ${url} HTTP/${req.httpVersion}`];

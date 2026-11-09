@@ -15,18 +15,31 @@ function getReverseFlow(srcIP, dstIP, srcPort, dstPort) {
   };
 }
 
+// Bound the number of disjoint ranges as well as their bytes. Byte capacity
+// alone lets tiny segments create tens of thousands of ranges, and every
+// insert/drain sorts them on the shared event loop. Real senders fill a 64 KiB
+// window with far fewer segments; extra ranges are dropped and retransmitted.
+const MAX_OUT_OF_ORDER_RANGES = 256;
+
 // Keep disjoint ranges, retaining the first copy of each byte. Sequence offsets
 // are relative to RCV.NXT so sorting also works across the 32-bit wrap boundary.
-function bufferTCPOutOfOrder(conn, sequence, payload, capacity) {
+function bufferTCPOutOfOrder(
+  conn,
+  sequence,
+  payload,
+  capacity,
+  maxRanges = MAX_OUT_OF_ORDER_RANGES,
+) {
   const start = (sequence - conn.vmSeq) >>> 0;
   if (start === 0 || start >= capacity) return;
+  if (conn.vmOutOfOrder.size >= maxRanges) return;
   const end = Math.min(start + payload.length, capacity);
   let cursor = start;
   const ranges = [...conn.vmOutOfOrder].sort((a, b) =>
     ((a[0] - conn.vmSeq) >>> 0) - ((b[0] - conn.vmSeq) >>> 0)
   );
   const add = (from, to) => {
-    if (to <= from) return;
+    if (to <= from || conn.vmOutOfOrder.size >= maxRanges) return;
     // Copy only retained bytes; a small range must not pin a large WS buffer.
     const chunk = Buffer.from(payload.subarray(from - start, to - start));
     conn.vmOutOfOrder.set((conn.vmSeq + from) >>> 0, chunk);
@@ -136,6 +149,7 @@ function parseTCPOptions(packet, start, end) {
 }
 
 module.exports = {
+  MAX_OUT_OF_ORDER_RANGES,
   bufferTCPOutOfOrder,
   corkForTurn,
   drainTCPOutOfOrder,
