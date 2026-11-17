@@ -379,3 +379,16 @@ test("ACKs restart the RTO without re-creating timers", () => {
   assert.equal(retransmissions.length, 1);
   assert.equal(retransmissions[0].seq, 105);
 });
+
+test("acknowledge after close ignores the ACK instead of throwing", () => {
+  const queue = new TCPRetransmissionQueue({
+    initialSequence: 100,
+    onRetransmit() {},
+    onExhausted() {},
+    setTimeoutFn: () => 1,
+    clearTimeoutFn() {},
+  });
+  queue.track({ seq: 100, payload: Buffer.from("abc") });
+  queue.close();
+  assert.deepEqual(queue.acknowledge(101), { status: "stale", ackedDataBytes: 0 });
+});

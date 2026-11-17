@@ -119,6 +119,9 @@ class TCPRetransmissionQueue {
 
   acknowledge(ackNumber) {
     const ack = ackNumber >>> 0;
+    // A late ACK after teardown carries nothing to acknowledge. close() drops
+    // the segments but keeps sndNxt, so processing it would throw below.
+    if (this.closed) return { status: "stale", ackedDataBytes: 0 };
     const advance = sequenceDistance(ack, this.sndUna);
     const outstanding = sequenceDistance(this.sndNxt, this.sndUna);
 
