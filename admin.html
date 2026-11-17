@@ -565,11 +565,15 @@
         };
       }
 
-      await fetch('/api/rules', {
+      const response = await fetch('/api/rules', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(rule),
       });
+      if (!response.ok) {
+        const { error } = await response.json().catch(() => ({}));
+        showToaster(error || `Failed to add rule (HTTP ${response.status}).`, true);
+      }
       loadRules();
     });
 

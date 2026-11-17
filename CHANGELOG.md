@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A malformed admin API request body no longer crashes the relay. Rule and
+  nickname requests are validated, limited to 64 KiB, and must use
+  `Content-Type: application/json`, so other web pages cannot create port
+  forwards through a browser. Removing a session nickname now works.
+- UDP port forwarding keeps one NAT mapping per external client, refreshed on
+  use and expired when idle, instead of one per datagram. A burst of about
+  10,000 datagrams no longer hangs the relay in an endless port search.
+- VM UDP traffic to Internet hosts is no longer diverted to port-forward
+  clients when its destination port happens to match a NAT mapping.
+- `TCP_WINDOW_SIZE` above 65535 is rejected at startup instead of failing on
+  the first connection.
+- A SYN on an established outbound connection (e.g. after a VM reboot reuses a
+  port) gets a challenge ACK (RFC 5961) so the VM can reset the stale
+  connection, instead of being ignored. Ports of just-closed connections can
+  be reused immediately.
+- The relay no longer answers the VM's handshake-completing ACK with an extra
+  ACK.
+- Sessions that share a MAC address (cloned VMs, emulator defaults) get
+  distinct IPs, and closing one no longer unregisters the other. DHCP
+  requests always receive the session's own IP, so a VM cannot drain the pool
+  by varying its client hardware address.
+- `GATEWAY_IP` now determines the VM subnet; it was previously hard-coded to
+  `10.0.2.0/24` in several places.
+- HTTP proxy rules with a target path keep the query string and the client's
+  path unchanged instead of normalizing them with `path.join`.
+- Generated UDP datagrams with a computed checksum of zero now carry `0xffff`
+  (RFC 768).
+- The number of buffered out-of-order TCP ranges is bounded, so tiny segments
+  cannot make each packet sort tens of thousands of ranges.
+
+### Changed
+
+- `LOG_LEVEL` defaults to `0`. Debug logging writes several lines per packet
+  and cost about 8% of loopback throughput even with output discarded.
+- The TCP retransmission timeout adapts to measured round-trip time (RFC 6298,
+  with Karn's algorithm), bounded below by `TCP_RTO_MIN_MS`. Connections are
+  aborted only after both `TCP_RTO_MAX_RETRANSMISSIONS` and
+  `TCP_RTO_GIVE_UP_MS` are exhausted.
+
+### Performance
+
+- Outgoing frames are built in a single buffer instead of three, with one
+  payload copy per segment.
+- Internet checksums are computed with 32-bit reads, about 2.4x faster for
+  full-size segments. Building and checksumming a 1460-byte TCP packet is
+  about 3x faster overall.
+- Clock reads are shared within each synchronous batch of work, and ACKs no
+  longer cancel and re-create the retransmission timer. Both matter on hosts
+  where reading the clock is a system call (HPET or ACPI PM clocksource).
+
 ## 0.6.1 — 2026-10-18
 
 ### Fixed

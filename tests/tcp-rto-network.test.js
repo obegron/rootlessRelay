@@ -7,10 +7,13 @@ const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
 const WebSocket = require("ws");
+const dgram = require("node:dgram");
 const {
   buildIPv4Packet,
   parseIPv4Packet,
+  parseUDPDatagram,
   tcpChecksum,
+  udpChecksum,
 } = require("../packet_utils");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -309,10 +312,7 @@ test(
         ack: (synAck.seq + 1) >>> 0,
         flags: { ack: true },
       }));
-      await frames.waitFor((frame) =>
-        frame.srcPort === remotePort && frame.dstPort === vmPort &&
-        frame.ackFlag && !frame.syn && frame.payload.length === 0
-      );
+      // A bare handshake-completing ACK gets no reply of its own.
 
       const socket = await accepted;
       const original = await frames.waitFor((frame) => frame.payload.equals(payload));
@@ -500,7 +500,12 @@ async function openTestConnection(reverse, {
     }));
     send({ seq: reverse ? 1000 : 1001,
       flags: { syn: reverse, ack: true }, payload: handshakePayload, windowScale, mss });
-    await frames.waitFor((frame) => frame.ackFlag && !frame.syn);
+    // The relay ACKs the VM's SYN-ACK when it opened the connection (reverse).
+    // An outbound handshake-completing ACK gets no reply of its own; callers
+    // that put data on it wait for that data's ACK themselves.
+    if (reverse) {
+      await frames.waitFor((frame) => frame.ackFlag && !frame.syn);
+    }
     return {
       frames, socket, send, received, relaySeq,
       async close() {
@@ -743,4 +748,171 @@ test("outbound TCP delivers data on the final handshake ACK without retransmissi
       await delay(20);
       assert.deepEqual(Buffer.concat(conn.received), payload);
     } finally { await conn.close(); }
+  });
+
+test("outbound TCP answers a SYN on an established connection with a challenge ACK",
+  { skip: process.env.RUN_NETWORK_TESTS !== "1", timeout: 10000 }, async () => {
+    const conn = await openTestConnection(false);
+    try {
+      // Only frames sent in response to the new SYN count.
+      await delay(50);
+      conn.frames.frames.length = 0;
+      // The VM "rebooted" and reuses the port with a new initial sequence.
+      conn.send({ seq: 5000, ack: 0, flags: { syn: true } });
+      const challenge = await conn.frames.waitFor((frame) =>
+        frame.ackFlag && !frame.syn && !frame.rst
+      );
+      assert.equal(challenge.ack, 1001, "challenge ACK reflects the old connection");
+
+      // The VM has no such connection, so it resets it; its SYN retry then
+      // opens a fresh connection.
+      conn.send({ seq: 1001, flags: { rst: true } });
+      await delay(20);
+      conn.send({ seq: 5000, ack: 0, flags: { syn: true } });
+      const synAck = await conn.frames.waitFor((frame) => frame.syn && frame.ackFlag);
+      assert.equal(synAck.ack, 5001);
+    } finally { await conn.close(); }
+  });
+
+function adminRequest(port, { method = "POST", pathname = "/api/rules", contentType, body }) {
+  return new Promise((resolve, reject) => {
+    const headers = {};
+    if (contentType) headers["Content-Type"] = contentType;
+    const request = http.request(
+      { host: "127.0.0.1", port, path: pathname, method, headers },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.once("end", () => resolve({
+          status: response.statusCode,
+          body: Buffer.concat(chunks).toString(),
+        }));
+      },
+    );
+    request.once("error", reject);
+    request.end(body);
+  });
+}
+
+test("admin API rejects malformed requests without crashing the relay",
+  { skip: process.env.RUN_NETWORK_TESTS !== "1", timeout: 10000 }, async () => {
+    const relay = await startRelay();
+    try {
+      const port = relay.adminPort;
+      assert.equal((await adminRequest(port, {
+        contentType: "application/json", body: "{",
+      })).status, 400);
+      assert.equal((await adminRequest(port, {
+        contentType: "text/plain", body: JSON.stringify({ type: "port" }),
+      })).status, 415, "simple cross-site requests are refused");
+      const invalid = await adminRequest(port, {
+        contentType: "application/json",
+        body: JSON.stringify({ type: "port", vm: VM_IP, port: 80, protocols: ["tcp"] }),
+      });
+      assert.equal(invalid.status, 400);
+      assert.match(JSON.parse(invalid.body).error, /host_port/);
+
+      const rules = await adminRequest(port, { method: "GET" });
+      assert.equal(rules.status, 200, "relay is still serving");
+      assert.deepEqual(JSON.parse(rules.body), []);
+    } finally { await relay.close(); }
+  });
+
+function buildUDPFrame({ srcIP, dstIP, srcPort, dstPort, payload }) {
+  const udp = Buffer.alloc(8 + payload.length);
+  udp.writeUInt16BE(srcPort, 0);
+  udp.writeUInt16BE(dstPort, 2);
+  udp.writeUInt16BE(udp.length, 4);
+  payload.copy(udp, 8);
+  const ip = buildIPv4Packet(udp, srcIP, dstIP, 17, 1);
+  ip.writeUInt16BE(udpChecksum(ip), 26);
+  const frame = Buffer.alloc(14 + ip.length);
+  GATEWAY_MAC.copy(frame, 0);
+  VM_MAC.copy(frame, 6);
+  frame.writeUInt16BE(0x0800, 12);
+  ip.copy(frame, 14);
+  return frame;
+}
+
+test("UDP port forward keeps one NAT entry per client and routes replies",
+  { skip: process.env.RUN_NETWORK_TESTS !== "1", timeout: 10000 }, async () => {
+    const relay = await startRelay();
+    const client = dgram.createSocket("udp4");
+    let bystander;
+    try {
+      const datagrams = [];
+      relay.ws.on("message", (data, isBinary) => {
+        if (!isBinary || data.readUInt16BE(12) !== 0x0800) return;
+        const ip = data.subarray(14);
+        const parsed = parseIPv4Packet(ip);
+        const udp = parsed && parseUDPDatagram(ip, parsed);
+        if (udp && parsed.dstIP === VM_IP) {
+          assert.equal(udpChecksum(parsed.packet), parsed.packet.readUInt16BE(26));
+          datagrams.push(udp);
+        }
+      });
+      relay.ws.send(buildARPRequest());
+      await delay(30);
+
+      const hostPort = await freeTcpPort();
+      assert.equal(await postJSON(relay.adminPort, "/api/rules", {
+        type: "port", protocols: ["udp"], host_port: hostPort,
+        bind_address: "127.0.0.1", vm: VM_IP, port: 5353,
+      }), 201);
+      await delay(50);
+
+      await new Promise((resolve) => client.bind(0, "127.0.0.1", resolve));
+      const replies = [];
+      client.on("message", (message) => replies.push(message.toString()));
+      client.send("one", hostPort, "127.0.0.1");
+      client.send("two", hostPort, "127.0.0.1");
+      const deadline = Date.now() + 2000;
+      while (datagrams.length < 2 && Date.now() < deadline) await delay(5);
+      assert.equal(datagrams.length, 2);
+      const natPort = datagrams[0].srcPort;
+      assert.equal(datagrams[1].srcPort, natPort, "one NAT entry per client");
+      assert.equal(datagrams[0].dstPort, 5353);
+
+      // A VM datagram to the same port number on a non-gateway host is
+      // ordinary Internet traffic and must not be diverted to the client.
+      bystander = dgram.createSocket("udp4");
+      const bystanderGot = new Promise((resolve) => bystander.once("message", resolve));
+      await new Promise((resolve, reject) => {
+        bystander.once("error", reject);
+        bystander.bind(natPort, "127.0.0.1", resolve);
+      });
+      relay.ws.send(buildUDPFrame({
+        srcIP: VM_IP, dstIP: "127.0.0.1", srcPort: 5353, dstPort: natPort,
+        payload: Buffer.from("internet"),
+      }));
+      assert.equal((await bystanderGot).toString(), "internet");
+
+      relay.ws.send(buildUDPFrame({
+        srcIP: VM_IP, dstIP: GATEWAY_IP, srcPort: 5353, dstPort: natPort,
+        payload: Buffer.from("reply"),
+      }));
+      const replyDeadline = Date.now() + 2000;
+      while (replies.length < 1 && Date.now() < replyDeadline) await delay(5);
+      assert.deepEqual(replies, ["reply"]);
+    } finally {
+      client.close();
+      bystander?.close();
+      await relay.close();
+    }
+  });
+
+test("relay refuses a TCP window that needs unnegotiated window scaling",
+  { skip: process.env.RUN_NETWORK_TESTS !== "1", timeout: 10000 }, async () => {
+    const child = spawn(process.execPath, [path.join(ROOT, "relay.js")], {
+      cwd: ROOT,
+      env: { ...process.env, ENABLE_WSS: "false", TCP_WINDOW_SIZE: "131072" },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const timer = setTimeout(() => child.kill("SIGKILL"), 3000);
+    const code = await new Promise((resolve) => child.once("exit", resolve));
+    clearTimeout(timer);
+    assert.notEqual(code, 0);
+    assert.match(stderr, /TCP_WINDOW_SIZE must be an integer from 1 through 65535/);
   });

@@ -79,3 +79,14 @@ test("same-millisecond aggregation preserves exact expiration boundaries", () =>
   now = 2000;
   assert.equal(limiter.usage, 0);
 });
+
+test("fractional byte counts leave no floating-point residue once the window empties", () => {
+  let now = 0;
+  const limiter = new SlidingWindowRateLimiter(10, 5, () => now);
+  for (let i = 0; i < 2000; i++) {
+    now += i % 3;
+    limiter.tryConsume((i % 300) / 100 + 0.1);
+  }
+  now += 100;
+  assert.equal(limiter.usage, 0);
+});

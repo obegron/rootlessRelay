@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  bufferTCPOutOfOrder, drainTCPOutOfOrder, parseTCPOptions, takeQueuedBytes,
+  MAX_OUT_OF_ORDER_RANGES, bufferTCPOutOfOrder, drainTCPOutOfOrder, parseTCPOptions, takeQueuedBytes,
 } = require("../tcp_utils");
 
 test("takeQueuedBytes coalesces adjacent buffers into one segment", () => {
@@ -92,6 +92,21 @@ test("TCP reassembly clips to the receive window and frees fully covered ranges"
   assert.equal(drainTCPOutOfOrder(conn, () => assert.fail("already delivered")), 0);
   assert.equal(conn.vmOutOfOrderBytes, 0);
   assert.equal(conn.vmOutOfOrder.size, 0);
+});
+
+test("TCP reassembly bounds the number of buffered ranges", () => {
+  const conn = { vmSeq: 0, vmOutOfOrder: new Map(), vmOutOfOrderBytes: 0 };
+  // One-byte segments with gaps between them: each would be its own range.
+  for (let offset = 2; offset < 2000; offset += 2) {
+    bufferTCPOutOfOrder(conn, offset, Buffer.alloc(1), 0xffff);
+  }
+  assert.equal(conn.vmOutOfOrder.size, MAX_OUT_OF_ORDER_RANGES);
+  assert.equal(conn.vmOutOfOrderBytes, MAX_OUT_OF_ORDER_RANGES);
+
+  // Draining still delivers the contiguous prefix once the gap is filled.
+  conn.vmSeq = 2;
+  assert.equal(drainTCPOutOfOrder(conn, () => {}), 1);
+  assert.equal(conn.vmSeq, 3);
 });
 
 test("corkForTurn batches ordered writes and preserves backpressure", async () => {

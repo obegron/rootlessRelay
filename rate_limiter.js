@@ -50,6 +50,9 @@ class SlidingWindowRateLimiter {
     if (this.head === this.entries.length) {
       this.entries.length = 0;
       this.head = 0;
+      // Nothing is in the window, so the total is exactly zero. Resetting it
+      // stops floating-point error from fractional byte counts accumulating.
+      this.totalBytes = 0;
     } else if (this.head >= 1024 && this.head * 2 >= this.entries.length) {
       this.entries = this.entries.slice(this.head);
       this.head = 0;
